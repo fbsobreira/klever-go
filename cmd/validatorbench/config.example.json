@@ -1,0 +1,33 @@
+{
+  "workload": "sc-call",
+  "contract_path": "testdata/adder.wasm",
+  "init_args": ["5"],
+  "call_function": "add",
+  "call_args": ["1"],
+
+  "num_transactions": 0,
+  "num_contracts": 4,
+  "num_accounts": 64,
+  "block_size": 200,
+  "concurrency": 0,
+  "duration": "30s",
+
+  "contract_complexity": 1,
+
+  "hash_algorithm": "blake2b",
+  "sha_hardware": "auto",
+
+  "tx_data_padding_bytes": 0,
+  "gas_limit": 5000000,
+  "gas_price": 0,
+  "initial_balance": 1000000000000,
+
+  "output_dir": "./bench-results",
+  "json_report": true,
+  "csv_report": true,
+  "verbose": false,
+  "progress_interval_seconds": 2,
+
+  "warmup_transactions": 200,
+  "compare_sha": false
+}
