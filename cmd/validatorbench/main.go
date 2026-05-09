@@ -2,10 +2,9 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
-	"io"
+	"math/big"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -84,196 +83,113 @@ func main() {
 	emitOutputs(cfg, report)
 }
 
-// runOnce sets up the VM environment, spins up generators, mempool, and
-// processor, and returns the resulting Report. Used both for normal and
-// compare-sha mode (in the latter, called from a child process).
+// runOnce sets up the BenchNode (production tx pipeline), pre-funds
+// accounts, builds the workload, and drives the BenchRunner under
+// the configured slot clock + per-block budget. Returns a Report.
+//
+// Everything in the measured path goes through the production code:
+// shardedTxPool, txProcessor, scProcessor, preprocess.transactions.
 func runOnce(cfg Config) (*Report, error) {
-	hashStats := &HashStats{}
-	env, err := NewVMEnv(cfg, hashStats)
+	bn, err := NewBenchNode(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("set up VM: %w", err)
+		return nil, fmt.Errorf("set up bench node: %w", err)
 	}
-	defer env.Close()
+	defer bn.Close()
 
-	builder := NewTxBuilder(cfg)
-
-	// If the user wrote a tx_mix the engine routes through the "mix"
-	// workload so multiple tx types and contracts can run in the same
-	// benchmark. Otherwise we honour the simple Workload field.
-	wlName := cfg.Workload
-	if len(cfg.TxMix) > 0 {
-		wlName = "mix"
+	// Provision sender accounts. The runner needs at least
+	// concurrency*2 senders for the transfer workload (sender +
+	// recipient per worker), so size up generously.
+	numAccounts := cfg.NumAccounts
+	if numAccounts < cfg.Concurrency*4 {
+		numAccounts = cfg.Concurrency * 4
 	}
-	wlCfg := cfg
-	wlCfg.Workload = wlName
-	wl, err := NewWorkload(wlCfg, env, builder)
+	if err := bn.ProvisionAccounts(numAccounts, cfg.InitialBalance); err != nil {
+		return nil, fmt.Errorf("provision accounts: %w", err)
+	}
+	// The owner pays for SC deploys. ProvisionAccounts only funds the
+	// sender pool; fund the owner separately so SC workloads don't fail
+	// on the deploy fee check.
+	if err := bn.FundAccount(bn.Owner().Address[:], cfg.InitialBalance); err != nil {
+		return nil, fmt.Errorf("fund owner: %w", err)
+	}
+	if err := bn.CommitState(); err != nil {
+		return nil, fmt.Errorf("commit owner funding: %w", err)
+	}
+
+	wl, err := selectProdWorkload(cfg, bn)
 	if err != nil {
 		return nil, err
 	}
 
-	// Optional warm-up: pump a small batch of txs to JIT-compile the wasm
-	// and populate caches before timing starts.
-	if cfg.WarmupTransactions > 0 {
-		warmup(env, wl, cfg)
-		hashStats.Reset()
-	}
-
-	// Mempool capacity: in budget mode we want it permanently overloaded
-	// so the processor never waits for txs and we measure its true
-	// ceiling. The capacity is the larger of (prefill, block_size * 8).
-	mempoolCap := cfg.BlockSize * 8
-	if cfg.PrefillMempool > mempoolCap {
-		mempoolCap = cfg.PrefillMempool
-	}
-	mp := NewMempool(mempoolCap)
-	metrics := NewMetrics(min(cfg.NumTransactions, 200_000), hashStats)
-	proc := NewProcessor(cfg, env, mp, metrics)
-
 	ctx, cancel := contextWithDuration(cfg.Duration)
 	defer cancel()
-
 	stopOnSignal(cancel)
 
-	// Prefill the mempool synchronously before timing starts. This is the
-	// cleanest way to simulate the "validator is overloaded" state where
-	// the per-block ceiling is the only thing limiting throughput.
-	if cfg.PrefillMempool > 0 {
-		fillCtx, fillCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		prefillMempool(fillCtx, cfg, mp, wl, metrics)
-		fillCancel()
+	// Slot clock + per-block budget come from config; defaults are
+	// klever mainnet (4s / 500ms).
+	slot := cfg.BlockTime
+	if slot <= 0 {
+		slot = 4 * time.Second
+	}
+	budget := cfg.BlockBudget
+	if budget <= 0 {
+		budget = 500 * time.Millisecond
 	}
 
-	if !cfg.Verbose {
-		// Even non-verbose runs deserve a heartbeat so it's clear the
-		// benchmark hasn't hung — operators tend to leave it alone.
-		go progressTicker(ctx, metrics, cfg, os.Stderr)
+	runner := NewBenchRunner(bn, wl, slot, budget, cfg.PrefillMempool, cfg.Concurrency)
+	rep, err := runner.Run(ctx, cfg.Duration)
+	if err != nil {
+		return nil, fmt.Errorf("runner: %w", err)
 	}
 
-	metrics.Start()
-	startGenerators(ctx, cfg, mp, wl, metrics)
-
-	// Run the processor on the main goroutine. It returns when ctx
-	// expires, the tx budget is hit, or the mempool is closed.
-	go func() {
-		// When generators stop pushing (because ctx canceled or budget
-		// hit), the mempool will drain and Drain() will block forever.
-		// We rely on ctx cancellation to release it.
-	}()
-	proc.Run(ctx, cfg.NumTransactions)
-	cancel()
-
-	// Drain any remaining txs the generators dropped after ctx died.
-	mp.Close()
-	metrics.Stop()
-
-	return BuildReport(cfg, metrics, env), nil
+	return reportFromRunReport(cfg, rep), nil
 }
 
-// prefillMempool synchronously generates Cfg.PrefillMempool transactions
-// using the configured workload + concurrency. The processor will only
-// start once this returns, so the timed phase begins with the mempool
-// full and the validator pipeline immediately under pressure — exactly
-// the state we want when measuring "max txs that fit in 500 ms".
-func prefillMempool(ctx context.Context, cfg Config, mp *Mempool, wl Workload, ms *Metrics) {
-	target := cfg.PrefillMempool
-	if target <= 0 {
-		return
-	}
-	produced := make(chan struct{}, target)
-	for i := 0; i < cfg.Concurrency; i++ {
-		go func(id int) {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-				tx := wl.Next(id)
-				t0 := time.Now()
-				if ed25519.Verify(tx.Sender.Public, tx.SigBody, tx.Signature) {
-					tx.Verified = true
-				}
-				ms.SigVerifyIntakeNs.Add(uint64(time.Since(t0).Nanoseconds()))
-				if !mp.Push(ctx, tx) {
-					return
-				}
-				produced <- struct{}{}
-			}
-		}(i)
-	}
-	for i := 0; i < target; i++ {
-		select {
-		case <-produced:
-		case <-ctx.Done():
-			return
+// selectProdWorkload picks a BenchWorkload implementation based on the
+// config. tx_mix isn't yet supported by the production path; for now
+// the simple workload field selects between transfer and sc-call.
+func selectProdWorkload(cfg Config, bn *BenchNode) (BenchWorkload, error) {
+	switch cfg.Workload {
+	case "transfer":
+		return NewProdTransferWorkload(bn, cfg.Concurrency, 1)
+	case "sc-call":
+		if cfg.ContractPath == "" {
+			return nil, fmt.Errorf("sc-call workload needs contract_path")
 		}
+		// Convert init/call args from the config templates. Production
+		// args are []byte; numeric strings become big-endian ints.
+		initArgs := encodeProdArgs(cfg.InitArgs)
+		callArgs := encodeProdArgs(cfg.CallArgsTpl)
+		instances := cfg.NumContracts
+		if instances < 1 {
+			instances = 1
+		}
+		return NewProdSCCallWorkload(bn, cfg.ContractPath, initArgs, cfg.CallFunction, callArgs, instances, cfg.GasLimit, cfg.Concurrency)
+	default:
+		return nil, fmt.Errorf("workload %q not yet supported on production path (use transfer or sc-call)", cfg.Workload)
 	}
 }
 
-// startGenerators launches `cfg.Concurrency` workload producers. Each
-// generator owns a slice of the sender pool (sharded modulo workerID)
-// to keep nonce contention minimal.
-func startGenerators(ctx context.Context, cfg Config, mp *Mempool, wl Workload, ms *Metrics) {
-	for i := 0; i < cfg.Concurrency; i++ {
-		go generatorLoop(ctx, i, cfg, mp, wl, ms)
+// encodeProdArgs translates the config's argument templates into the
+// raw []byte form the production tx-build path expects. Numeric
+// strings become big-endian unsigned bigints; everything else is
+// treated as raw bytes.
+func encodeProdArgs(in []string) [][]byte {
+	out := make([][]byte, 0, len(in))
+	for _, s := range in {
+		if s == "" {
+			out = append(out, []byte{})
+			continue
+		}
+		if n, ok := new(big.Int).SetString(s, 10); ok {
+			out = append(out, n.Bytes())
+			continue
+		}
+		out = append(out, []byte(s))
 	}
+	return out
 }
 
-func generatorLoop(ctx context.Context, id int, cfg Config, mp *Mempool, wl Workload, ms *Metrics) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		tx := wl.Next(id)
-		// Verify ed25519 here, in the generator goroutine, so the cost
-		// is amortised across all available cores BEFORE the block
-		// budget clock starts. This mirrors a real validator's mempool
-		// intake path: signatures are checked when the tx arrives, not
-		// when the block builder picks it up. The 500ms slot budget is
-		// therefore spent only on execution + state updates.
-		t0 := time.Now()
-		if ed25519.Verify(tx.Sender.Public, tx.SigBody, tx.Signature) {
-			tx.Verified = true
-		}
-		ms.SigVerifyIntakeNs.Add(uint64(time.Since(t0).Nanoseconds()))
-		if !mp.Push(ctx, tx) {
-			return
-		}
-	}
-}
-
-// warmup pushes a fixed batch through the VM with timing disabled. It
-// JITs the contract, populates account caches, and lets the runtime
-// settle into a steady state.
-func warmup(env *VMEnv, wl Workload, cfg Config) {
-	for i := 0; i < cfg.WarmupTransactions; i++ {
-		tx := wl.Next(i % cfg.Concurrency)
-		_, _, _ = env.ExecuteTx(tx, &HashStats{})
-	}
-}
-
-// progressTicker prints a one-line stat snapshot every cfg.ProgressSec.
-// It stops when ctx is canceled.
-func progressTicker(ctx context.Context, m *Metrics, cfg Config, w io.Writer) {
-	if cfg.ProgressSec <= 0 {
-		return
-	}
-	t := time.NewTicker(time.Duration(cfg.ProgressSec) * time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			tx := m.TxTotal.Load()
-			fail := m.TxFailed.Load()
-			elapsed := time.Since(m.StartedAt).Seconds()
-			tps := float64(tx) / elapsed
-			fmt.Fprintf(w, "  ... %.0fs elapsed | tx=%d (failed=%d) | %.0f tx/s\n",
-				elapsed, tx, fail, tps)
-		}
-	}
-}
 
 // emitOutputs writes the text report to stderr (so it doesn't pollute
 // stdout when piped) and any configured JSON/CSV files. Child processes

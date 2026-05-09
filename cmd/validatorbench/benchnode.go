@@ -139,8 +139,9 @@ type BenchNode struct {
 	txProcessor    process.TransactionProcessor
 	txPreprocessor benchTxPreprocessor
 
-	// owner used for SC deploys
-	owner *BenchAccount
+	// owner used for SC deploys + per-bench-run sender pool
+	owner   *BenchAccount
+	senders []*BenchAccount
 }
 
 // benchTxPreprocessor exposes the subset of preprocess.transactions's
@@ -199,6 +200,29 @@ func (bn *BenchNode) Close() {
 
 // Owner returns the deploy-owner account.
 func (bn *BenchNode) Owner() *BenchAccount { return bn.owner }
+
+// Senders returns the funded sender pool. Empty until ProvisionAccounts
+// is called by the runner setup.
+func (bn *BenchNode) Senders() []*BenchAccount { return bn.senders }
+
+// ProvisionAccounts mints `count` fresh keypairs, funds each with
+// `balance` KLV via the production AccountsCacher path, then commits
+// state once at the end. Subsequent BuildSigned* calls draw from this
+// pool. Idempotent for the count argument: calling twice with count=N
+// gives you 2N accounts total.
+func (bn *BenchNode) ProvisionAccounts(count int, balance int64) error {
+	for i := 0; i < count; i++ {
+		acc, err := newBenchAccount()
+		if err != nil {
+			return fmt.Errorf("mint sender %d: %w", i, err)
+		}
+		if err := bn.FundAccount(acc.Address[:], balance); err != nil {
+			return fmt.Errorf("fund sender %d: %w", i, err)
+		}
+		bn.senders = append(bn.senders, acc)
+	}
+	return bn.CommitState()
+}
 
 // AccountsCacher exposes the production accounts cacher so other layers
 // can fund accounts or read state.
