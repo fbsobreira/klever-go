@@ -53,6 +53,7 @@ import (
 	"github.com/klever-io/klever-go/data/retriever"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/data/state/factory"
+	dataTransaction "github.com/klever-io/klever-go/data/transaction"
 	"github.com/klever-io/klever-go/data/trie"
 	eventMock "github.com/klever-io/klever-go/eventNotifier/mock"
 	"github.com/klever-io/klever-go/kapps"
@@ -61,6 +62,7 @@ import (
 	"github.com/klever-io/klever-go/storage/memorydb"
 	"github.com/klever-io/klever-go/storage/storageUnit"
 	"github.com/klever-io/klever-go/storage/txcache"
+	"github.com/klever-io/klever-go/tools"
 	"github.com/klever-io/klever-go/tools/marshal"
 	"github.com/klever-io/klever-go/tools/typeConverters/uint64ByteSlice"
 	"github.com/klever-io/klever-go/vmcommon/parsers"
@@ -631,3 +633,126 @@ func newBenchAccountsDB(fact state.AccountFactory, hasher hashing.Hasher, m mars
 	adb, _ := state.NewAccountsDB(tr, hasher, m, fact, core.Normal)
 	return adb
 }
+
+// ---------------------------------------------------------------------------
+// Stage 5: helpers — fund accounts, build & sign real Transaction protos,
+//          push them through the production preprocessor.
+//
+// These wrap (not re-implement) the production transaction-build path:
+//
+//   - transaction.NewBaseTransaction + tx.PushContract — same constructors
+//     the node uses to build any tx.
+//   - tx.RawData hash via tools.CalculateHash — same hash function the
+//     interceptor + tx processor compute.
+//   - ed25519 sign on the raw hash — same single-signer the production
+//     KeyGen + SingleSigner pair would produce.
+//
+// The bench's intake path then pushes (hash, tx) into the production
+// shardedTxPool via dataPool.Transactions().AddData(hash, tx, size, "0").
+// ---------------------------------------------------------------------------
+
+// chainID is the protocol identifier baked into every tx. The bench can
+// pick any value as long as it stays consistent across all signed txs in
+// a single run; the production tx processor only checks it for equality.
+var benchChainID = []byte("bench")
+
+// FundAccount creates the user account in the production state trie and
+// credits it with the given KLV balance via the same UserKDA path the
+// kapps controller uses at genesis. Idempotent: re-funding an existing
+// account just sets the new balance.
+func (bn *BenchNode) FundAccount(addr []byte, balance int64) error {
+	acc, err := bn.cacher.LoadUser(addr)
+	if err != nil {
+		return fmt.Errorf("load %x: %w", addr[:8], err)
+	}
+	if err := acc.SetUserKDA(nil, nil, &kapps.UserKDA{Balance: balance}); err != nil {
+		return fmt.Errorf("set KLV balance: %w", err)
+	}
+	return bn.cacher.SaveUser(acc)
+}
+
+// BuildSignedTransfer constructs a fully-signed value-transfer tx using
+// the production tx model. Returns (tx, txHash, error). The caller is
+// responsible for pushing (txHash, tx) into the mempool — usually via
+// the bench's intake.go.
+//
+// Note: tx.RawData.Nonce is taken from sender.Nonce, then sender.Nonce
+// is incremented. Generators that share a sender across goroutines must
+// serialise nonce assignment.
+func (bn *BenchNode) BuildSignedTransfer(sender *BenchAccount, recipient []byte, value int64) (*dataTransaction.Transaction, []byte, error) {
+	tx := dataTransaction.NewBaseTransaction(sender.Address[:], sender.Nonce, [][]byte{}, 0, 0)
+	if err := tx.SetChainID(benchChainID); err != nil {
+		return nil, nil, fmt.Errorf("chain id: %w", err)
+	}
+	tx.RawData.Version = 1
+
+	tc := &dataTransaction.TransferContract{
+		ToAddress: recipient,
+		Amount:    value,
+	}
+	if err := tx.PushContract(dataTransaction.TXContract_TransferContractType, tc); err != nil {
+		return nil, nil, fmt.Errorf("push contract: %w", err)
+	}
+
+	// Compute fees the same way ProcessorNode.computeTransactionCost does.
+	cost, err := bn.economics.ComputeTransactionCost(tx, true)
+	if err != nil {
+		return nil, nil, fmt.Errorf("compute cost: %w", err)
+	}
+	tx.RawData.BandwidthFee = cost.BandwidthFee
+	tx.RawData.KAppFee = cost.KAppFee
+
+	// Hash the raw bytes the validator will hash on its side.
+	txHash, err := tools.CalculateHash(bn.marshalizer, bn.hasher, tx.GetRaw())
+	if err != nil {
+		return nil, nil, fmt.Errorf("calc hash: %w", err)
+	}
+
+	// Sign the hash with the sender's ed25519 private key. Production uses
+	// the SingleSigner abstraction; we go direct for cheaper allocation in
+	// the bench's hot path. The signature bytes are identical.
+	sig := ed25519.Sign(sender.Private, txHash)
+	tx.Signature = [][]byte{sig}
+
+	sender.Nonce++
+	return tx, txHash, nil
+}
+
+// PushTx submits a signed transaction to the production mempool exactly
+// the way the validator does after the interceptor has accepted it from
+// P2P: shardedTxPool.AddData(hash, tx, size, cacheID).
+func (bn *BenchNode) PushTx(txHash []byte, tx *dataTransaction.Transaction) {
+	size := tx.GetSize()
+	bn.dataPool.Transactions().AddData(txHash, tx, size, txCacheID)
+}
+
+// txCacheID is the shard cache identifier shardedTxPool keys per-source
+// pools by. Single-node bench always uses shard "0".
+const txCacheID = "0"
+
+// CommitState flushes the in-memory accounts journal into the trie. The
+// production block processor calls this at the end of each block.
+func (bn *BenchNode) CommitState() error {
+	if err := bn.cacher.SaveAll(); err != nil {
+		return err
+	}
+	if _, err := bn.accountsDB.Commit(); err != nil {
+		return err
+	}
+	if _, err := bn.kappsDB.Commit(); err != nil {
+		return err
+	}
+	if _, err := bn.peersDB.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// TxPreprocessor returns the real production preprocessor. The bench's
+// per-slot loop calls .CreateAndProcessBlockTransactions(blk, haveTime)
+// directly — that's the validator's actual block-production entry point.
+func (bn *BenchNode) TxPreprocessor() benchTxPreprocessor { return bn.txPreprocessor }
+
+// DataPool exposes the underlying pools holder so external code (intake
+// + tests) can inspect the mempool.
+func (bn *BenchNode) DataPool() retriever.PoolsHolder { return bn.dataPool }
