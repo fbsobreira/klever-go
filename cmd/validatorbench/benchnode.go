@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	syncGo "sync"
+	"time"
 
 	"github.com/klever-io/klever-go/common"
 	commonMock "github.com/klever-io/klever-go/common/mock"
@@ -30,6 +31,7 @@ import (
 	"github.com/klever-io/klever-go/core/kapp"
 	kappcontroller "github.com/klever-io/klever-go/core/kapp/kappController"
 	"github.com/klever-io/klever-go/core/process"
+	"github.com/klever-io/klever-go/core/process/kda/kdautils"
 	"github.com/klever-io/klever-go/core/process/block/postprocess"
 	"github.com/klever-io/klever-go/core/process/economics"
 	"github.com/klever-io/klever-go/core/process/factory/chain"
@@ -178,6 +180,9 @@ func NewBenchNode(cfg Config) (*BenchNode, error) {
 	if err := bn.initOwner(); err != nil {
 		return nil, err
 	}
+	if err := bn.initSystemAssets(); err != nil {
+		return nil, err
+	}
 	return bn, nil
 }
 
@@ -290,6 +295,18 @@ func (bn *BenchNode) initKAppController() error {
 	if err := ctrl.SetProposalController(prop); err != nil {
 		return fmt.Errorf("kapp controller set proposal: %w", err)
 	}
+
+	// Wire the cacher into every internal kapp module + back-pointer the
+	// controller into each one. Production runs this at startup
+	// (factory/process.go + processorNode.go::initBlockProcessor); without
+	// it any kapp.GetCurrentKAppContext() panics on nil controller.
+	if err := ctrl.InitKApps(bn.cacher); err != nil {
+		return fmt.Errorf("kapp init: %w", err)
+	}
+	// Reset the cacher's own kapp-account map so it re-reads from the
+	// freshly wired adapters. Mirrors processorNode.go's call after init.
+	bn.cacher.ResetAll(bn.forkController.ProcessorFlowITOPrice())
+
 	bn.kappCtrl = ctrl
 	bn.proposalCt = prop
 	return nil
@@ -656,17 +673,103 @@ func newBenchAccountsDB(fact state.AccountFactory, hasher hashing.Hasher, m mars
 // a single run; the production tx processor only checks it for equality.
 var benchChainID = []byte("bench")
 
+// initSystemAssets registers the KLV + KFI tokens in the kapps KDA
+// account, mirroring kvm/mock/world::CreateTestAssets and what the
+// genesis.Process step does on a real validator. Without these the
+// production tx processor's KDA lookup returns "asset not found" the
+// first time a tx tries to pay BandwidthFee in KLV.
+func (bn *BenchNode) initSystemAssets() error {
+	klvData, err := bn.marshalizer.Marshal(&kapps.KDAData{
+		ID:                kdautils.KLVIdentifier,
+		AssetType:         kapps.KDAData_Fungible,
+		Name:              []byte("KLEVER"),
+		Ticker:            kdautils.KLVIdentifier,
+		Precision:         6,
+		InitialSupply:     10_000_000_000_000_000,
+		CirculatingSupply: 100_000_000_000_000,
+		MaxSupply:         90_000_000_000_000_000,
+		IssueDate:         time.Now().Unix(),
+		Royalties:         &kapps.RoyaltiesData{},
+		Properties:        &kapps.PropertiesData{CanFreeze: true, CanMint: true, CanBurn: true},
+		Attributes:        &kapps.AttributesData{IsNFTMintStopped: true},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal klv: %w", err)
+	}
+	kfiData, err := bn.marshalizer.Marshal(&kapps.KDAData{
+		ID:                kdautils.KFIIdentifier,
+		AssetType:         kapps.KDAData_Fungible,
+		Name:              []byte("KLEVER FINANCE"),
+		Ticker:            kdautils.KFIIdentifier,
+		Precision:         6,
+		InitialSupply:     10_000_000_000_000_000,
+		CirculatingSupply: 100_000_000_000_000,
+		MaxSupply:         90_000_000_000_000_000,
+		IssueDate:         time.Now().Unix(),
+		Royalties:         &kapps.RoyaltiesData{},
+		Properties:        &kapps.PropertiesData{CanFreeze: true, CanMint: true, CanBurn: true},
+		Attributes:        &kapps.AttributesData{IsNFTMintStopped: true},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal kfi: %w", err)
+	}
+
+	kdaAccount, err := bn.kappsDB.LoadAccount(kapps.KDAKAppAddress)
+	if err != nil {
+		return fmt.Errorf("load kda kapp account: %w", err)
+	}
+	kdaKapp, ok := kdaAccount.(state.KAppAccountHandler)
+	if !ok {
+		return fmt.Errorf("kda account wrong type: %T", kdaAccount)
+	}
+	if err := kdaKapp.DataTrieTracker().SaveKeyValue(kdautils.ToKDAKey(kdautils.KLVIdentifier, nil), klvData); err != nil {
+		return fmt.Errorf("save klv: %w", err)
+	}
+	if err := kdaKapp.DataTrieTracker().SaveKeyValue(kdautils.ToKDAKey(kdautils.KFIIdentifier, nil), kfiData); err != nil {
+		return fmt.Errorf("save kfi: %w", err)
+	}
+	if err := bn.kappsDB.SaveAccount(kdaAccount); err != nil {
+		return fmt.Errorf("save kda kapp account: %w", err)
+	}
+
+	// Touch the other system kapp accounts (validators, proposal, ITO,
+	// market, fees pool, system) so their addresses exist in the trie.
+	// Production has these registered via the genesis kapps init.
+	for _, addr := range [][]byte{
+		kapps.StakingKAppAddress,
+		kapps.ProposalKAppAddress,
+		kapps.ITOKAppAddress,
+		kapps.MarketKAppAddress,
+		kapps.ValidatorsKAppAddress,
+		kapps.KDAFeesPoolKAppAddress,
+		kapps.SystemAccountKAppAddress,
+	} {
+		acc, err := bn.kappsDB.LoadAccount(addr)
+		if err != nil {
+			return fmt.Errorf("touch kapp %x: %w", addr[:8], err)
+		}
+		if err := bn.kappsDB.SaveAccount(acc); err != nil {
+			return fmt.Errorf("save kapp %x: %w", addr[:8], err)
+		}
+	}
+	if _, err := bn.kappsDB.Commit(); err != nil {
+		return fmt.Errorf("commit kapps: %w", err)
+	}
+	return nil
+}
+
 // FundAccount creates the user account in the production state trie and
-// credits it with the given KLV balance via the same UserKDA path the
-// kapps controller uses at genesis. Idempotent: re-funding an existing
-// account just sets the new balance.
+// credits it with the given KLV balance using the same AddToBalance path
+// the production tx processor walks during transfer execution. KLV is
+// special-cased on userAccount.Balance (not the per-KDA trie key), so
+// we go through AddToBalance(value, nil, …) for the KLV asset.
 func (bn *BenchNode) FundAccount(addr []byte, balance int64) error {
 	acc, err := bn.cacher.LoadUser(addr)
 	if err != nil {
 		return fmt.Errorf("load %x: %w", addr[:8], err)
 	}
-	if err := acc.SetUserKDA(nil, nil, &kapps.UserKDA{Balance: balance}); err != nil {
-		return fmt.Errorf("set KLV balance: %w", err)
+	if err := acc.AddToBalance(balance, nil, true); err != nil {
+		return fmt.Errorf("add KLV balance: %w", err)
 	}
 	return bn.cacher.SaveUser(acc)
 }
