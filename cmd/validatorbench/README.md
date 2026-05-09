@@ -34,10 +34,16 @@ per-slot calls into the real preprocessor:
 
 ```
 generator (BuildSignedTransfer / BuildSignedSCCall via BenchNode)
-   -> shardedTxPool.AddData                         [production intake]
+   -> dataValidators.txValidator.CheckTxValidity     [PRODUCTION INTAKE: nonce
+                                                      window + ed25519 verify,
+                                                      OFF the per-block budget,
+                                                      runs in the 3.5s gap
+                                                      between slots]
+   -> shardedTxPool.AddData                         [production mempool]
    -> preprocess.transactions
         .CreateAndProcessBlockTransactions(blk, haveTime)
-                                                    [production block production]
+                                                    [PRODUCTION BLOCK PRODUCTION,
+                                                     ON the per-block budget]
         -> transaction.txProcessor.ProcessTransaction
         -> smartContract.scProcessor.ExecuteSmartContractTransaction
         -> wasmer2 VM container
@@ -47,6 +53,10 @@ generator (BuildSignedTransfer / BuildSignedSCCall via BenchNode)
 `haveTime` is the per-block CPU budget (klever mainnet: 500 ms). The
 slot clock is the chain block interval (klever mainnet: 4 s). Both are
 configurable.
+
+The bench reports intake (off-budget) and execution (on-budget) wall
+times separately — that's the only honest way to compare against the
+"3.5 s window between slots" reasoning operators use.
 
 ## What it measures
 
@@ -69,19 +79,79 @@ LD_LIBRARY_PATH=$(pwd)/kvm/wasmer2 \
   go build -o bin/validatorbench ./cmd/validatorbench
 ```
 
-## Run
+## Run modes
+
+The bench has three modes; they all share the same production
+pipeline (intake → shardedTxPool → preprocessor → txProcessor →
+state). What differs is the termination criterion and load shape.
+
+### 1. Chain-realistic (default — `--duration T`)
+
+Slot clock ticks every `--block-time` (default 4 s). Each slot the
+preprocessor has `--block-budget` (default 500 ms) of CPU. Background
+producers run continuously through the production intake path. Use
+this to measure **the chain-realistic ceiling** — what consensus
+actually sees on a saturated chain.
 
 ```bash
-# Pure transfer workload (no VM dispatch)
 LD_LIBRARY_PATH=$(pwd)/kvm/wasmer2 \
   ./bin/validatorbench \
     --workload transfer \
     --duration 30s \
     --prefill 30000 \
     --concurrency 4 \
-    --accounts 200
+    --accounts 1024
+```
 
-# SC-call workload (real wasmer2 VM)
+Headline metric: `EFFECTIVE MAX TPS = avg_tx_per_slot ÷ slot_interval`.
+
+### 2. Bounded (`--tx N`)
+
+Synchronously inject exactly N transactions through the production
+intake path, then run slots until the preprocessor has drained them.
+Use this to measure **how long this hardware takes to clear N pending
+txs at production timing**.
+
+```bash
+LD_LIBRARY_PATH=$(pwd)/kvm/wasmer2 \
+  ./bin/validatorbench \
+    --workload transfer \
+    --tx 12000 \
+    --duration 30s \
+    --concurrency 4 \
+    --accounts 1024
+```
+
+Headline metric: total wall time + slot count to drain the batch.
+
+### 3. Saturate (`--saturate`)
+
+Drop the slot clock + per-block budget entirely. Run for `--duration`
+with producer + processor flat-out. Use this to measure **the host's
+raw hardware ceiling** (intake rate + execution rate, no chain
+timing). NOT chain-realistic — it answers "how much can this CPU
+do without slot/budget constraints", not "what TPS will the validator
+ship to consensus".
+
+```bash
+LD_LIBRARY_PATH=$(pwd)/kvm/wasmer2 \
+  ./bin/validatorbench \
+    --workload transfer \
+    --saturate \
+    --duration 30s \
+    --prefill 12000 \
+    --concurrency 4 \
+    --accounts 1024
+```
+
+Headline metric: total tx ÷ wall time = raw tx/s ceiling.
+
+### SC workloads
+
+All three modes work with the SC workload too — pass
+`--workload sc-call --contract <path.wasm> --call <fn>`:
+
+```bash
 LD_LIBRARY_PATH=$(pwd)/kvm/wasmer2 \
   ./bin/validatorbench \
     --workload sc-call \
