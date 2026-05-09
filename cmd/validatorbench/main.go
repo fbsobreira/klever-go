@@ -137,7 +137,19 @@ func runOnce(cfg Config) (*Report, error) {
 	}
 
 	runner := NewBenchRunner(bn, wl, slot, budget, cfg.PrefillMempool, cfg.Concurrency)
-	rep, err := runner.Run(ctx, cfg.Duration)
+
+	// Three modes:
+	//   - --tx N      → bounded (inject exactly N, run slots until drained)
+	//   - --saturate  → no slot clock, raw hardware ceiling
+	//   - default     → chain-realistic slot clock for --duration
+	mode := ModeDuration
+	if cfg.SaturateMode {
+		mode = ModeSaturate
+	} else if cfg.NumTransactions > 0 {
+		mode = ModeBounded
+	}
+
+	rep, err := runner.Run(ctx, mode, cfg.Duration, cfg.NumTransactions)
 	if err != nil {
 		return nil, fmt.Errorf("runner: %w", err)
 	}

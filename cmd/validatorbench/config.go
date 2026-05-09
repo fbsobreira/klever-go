@@ -118,6 +118,14 @@ type Config struct {
 	BlockBudget     time.Duration `json:"-"`
 	BlockBudgetStr  string        `json:"block_budget"`
 	PrefillMempool  int           `json:"prefill_mempool"`
+
+	// SaturateMode (--saturate) drops the slot clock + per-block budget
+	// entirely. The runner just lets producer + processor run flat-out
+	// for the configured Duration. Useful for sizing the host's raw
+	// hardware ceiling (intake rate + execution rate) — NOT for the
+	// chain-realistic ceiling under the live network's 4s/500ms timing
+	// (which is the default mode).
+	SaturateMode bool `json:"saturate_mode"`
 }
 
 // DefaultConfig returns a benchmark config tuned for a single-node validator

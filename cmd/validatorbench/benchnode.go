@@ -33,16 +33,18 @@ import (
 	"github.com/klever-io/klever-go/core/kapp"
 	kappcontroller "github.com/klever-io/klever-go/core/kapp/kappController"
 	"github.com/klever-io/klever-go/core/process"
-	"github.com/klever-io/klever-go/core/process/kda/kdautils"
 	"github.com/klever-io/klever-go/core/process/block/postprocess"
+	"github.com/klever-io/klever-go/core/process/block/preprocess"
+	"github.com/klever-io/klever-go/core/process/dataValidators"
 	"github.com/klever-io/klever-go/core/process/economics"
 	"github.com/klever-io/klever-go/core/process/factory/chain"
+	"github.com/klever-io/klever-go/core/process/interceptors"
+	"github.com/klever-io/klever-go/core/process/kda/kdautils"
 	"github.com/klever-io/klever-go/core/process/rating"
 	"github.com/klever-io/klever-go/core/process/smartContract"
 	"github.com/klever-io/klever-go/core/process/smartContract/builtInFunctions"
 	"github.com/klever-io/klever-go/core/process/smartContract/hooks"
 	"github.com/klever-io/klever-go/core/process/smartContract/hooks/counters"
-	"github.com/klever-io/klever-go/core/process/block/preprocess"
 	"github.com/klever-io/klever-go/core/process/transaction"
 	"github.com/klever-io/klever-go/core/process/transactionLog"
 	kleverCrypto "github.com/klever-io/klever-go/crypto"
@@ -138,6 +140,11 @@ type BenchNode struct {
 	// production tx processing pipeline
 	txProcessor    process.TransactionProcessor
 	txPreprocessor benchTxPreprocessor
+
+	// production intake-time tx validator. CheckTxValidity is what the
+	// real interceptor runs in the 3.5s gap between slots: nonce window,
+	// account-exists, signature crypto verify. Off the per-block budget.
+	txValidator process.TxValidator
 
 	// owner used for SC deploys + per-bench-run sender pool
 	owner   *BenchAccount
@@ -638,6 +645,41 @@ func (bn *BenchNode) initProcessors() error {
 		return fmt.Errorf("preprocessor: %w", err)
 	}
 	bn.txPreprocessor = pp
+
+	// Production intake-time tx validator. Same constructor + same
+	// argument shape as factory/process.go uses. Whitelist starts empty;
+	// nothing in the bench is whitelisted, so every tx walks the full
+	// signature/nonce/balance path the real interceptor exercises.
+	whiteListCache, err := storageUnit.NewCache(storageUnit.CacheConfig{
+		Type: storageUnit.LRUCache, Capacity: 10000, Shards: 1,
+	})
+	if err != nil {
+		return fmt.Errorf("whitelist cache: %w", err)
+	}
+	whiteList, err := interceptors.NewWhiteListDataVerifier(whiteListCache)
+	if err != nil {
+		return fmt.Errorf("whitelist verifier: %w", err)
+	}
+	tv, err := dataValidators.NewTxValidator(
+		bn.accountsDB,
+		newMemUnit(),
+		bn.dataPool,
+		whiteList,
+		bn.pubkeyConv,
+		bn.singleSigner,
+		bn.keyGen,
+		bn.kappCtrl,
+		// maxNonceDeltaAllowed: same value the production interceptor
+		// uses (factory/process.go) — N is from chain config; the bench
+		// just needs a wide window so background producers can stay
+		// many nonces ahead of the slot processor without txs being
+		// rejected at intake.
+		1024,
+	)
+	if err != nil {
+		return fmt.Errorf("tx validator: %w", err)
+	}
+	bn.txValidator = tv
 	return nil
 }
 
@@ -1000,6 +1042,59 @@ func (bn *BenchNode) PushTx(txHash []byte, tx *dataTransaction.Transaction) {
 	size := tx.GetSize()
 	bn.dataPool.Transactions().AddData(txHash, tx, size, txCacheID)
 }
+
+// IntakeVerify runs the production txValidator's CheckTxValidity on the
+// supplied tx using its already-computed hash. This is the exact code
+// path the live validator's interceptor walks during the 3.5s window
+// between slots: nonce-window check, account-exists check, ed25519
+// signature verify. Returns nil if the tx would be accepted into the
+// mempool, an error otherwise.
+//
+// Mirrors what dataValidators.txValidator does over an
+// InterceptedTransaction, but constructs the validator-handler
+// interface directly from our pre-built *Transaction so we don't pay
+// the full re-marshal cost for every intake.
+func (bn *BenchNode) IntakeVerify(txHash []byte, tx *dataTransaction.Transaction) error {
+	return bn.txValidator.CheckTxValidity(&txValidatorAdapter{
+		tx:   tx,
+		hash: txHash,
+	})
+}
+
+// txValidatorAdapter satisfies process.TxValidatorHandler and the
+// process.InterceptedData interface the txValidator's whitelist check
+// uses. It just exposes accessors over our already-built tx — no
+// re-marshal, no re-hash.
+type txValidatorAdapter struct {
+	tx   *dataTransaction.Transaction
+	hash []byte
+}
+
+func (a *txValidatorAdapter) SenderAddress() []byte    { return a.tx.GetSender() }
+func (a *txValidatorAdapter) Nonce() uint64            { return a.tx.GetNonce() }
+func (a *txValidatorAdapter) Fee() int64               { return a.tx.GetTotalFees() }
+func (a *txValidatorAdapter) KDAFee() data.KDAFeeHandler { return nil }
+func (a *txValidatorAdapter) PermissionID() int32      { return a.tx.RawData.GetPermissionID() }
+func (a *txValidatorAdapter) ValidatePermissionOperation(_ []byte) error { return nil }
+func (a *txValidatorAdapter) Signature() [][]byte      { return a.tx.Signature }
+
+// InterceptedData methods. The txValidator type-asserts to
+// process.InterceptedData and uses Hash() during signature
+// verification. The cast must succeed, which requires the full
+// method set including IsInterfaceNil.
+func (a *txValidatorAdapter) CheckValidity() error  { return nil }
+func (a *txValidatorAdapter) Hash() []byte          { return a.hash }
+func (a *txValidatorAdapter) Type() string          { return "transaction" }
+func (a *txValidatorAdapter) Identifiers() [][]byte { return [][]byte{a.hash} }
+func (a *txValidatorAdapter) String() string        { return "" }
+func (a *txValidatorAdapter) IsInterfaceNil() bool  { return a == nil }
+
+// TxValidator returns the production-style intake validator. Call its
+// CheckTxValidity(interceptedTx) before PushTx to mirror the validator's
+// 3.5s-window intake path: nonce-window check, account-exists check,
+// crypto signature verify. The intake-verify cost is OFF the per-block
+// budget because production runs it in the gap between slots.
+func (bn *BenchNode) TxValidator() process.TxValidator { return bn.txValidator }
 
 // txCacheID is the shard cache identifier shardedTxPool keys per-source
 // pools by. Single-node bench always uses shard "0".

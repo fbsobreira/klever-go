@@ -36,6 +36,7 @@ type cliOverrides struct {
 	BlockTime    time.Duration
 	BlockBudget  time.Duration
 	Prefill      int
+	Saturate     bool
 
 	// Tracking flags that were actually set so we can distinguish
 	// between "user said 0" and "user didn't say".
@@ -78,6 +79,7 @@ func parseFlags() (cliOverrides, string, bool) {
 	fs.DurationVar(&o.BlockTime, "block-time", 0, "chain slot interval (e.g. 3s); enables budget mode together with --block-budget")
 	fs.DurationVar(&o.BlockBudget, "block-budget", 0, "max processing time per block (e.g. 500ms); the headline EFFECTIVE MAX TPS comes from this")
 	fs.IntVar(&o.Prefill, "prefill", 0, "transactions to pre-generate into the mempool before timing starts (recommended in budget mode)")
+	fs.BoolVar(&o.Saturate, "saturate", false, "saturate mode: drop slot clock + per-block budget; measure raw hardware ceiling")
 	fs.BoolVar(&version, "version", false, "print version and exit")
 
 	fs.Usage = func() {
@@ -185,5 +187,8 @@ func mergeCLIIntoConfig(cfg *Config, o cliOverrides) {
 	}
 	if o.setMask["prefill"] {
 		cfg.PrefillMempool = o.Prefill
+	}
+	if o.setMask["saturate"] {
+		cfg.SaturateMode = o.Saturate
 	}
 }

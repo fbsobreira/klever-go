@@ -30,8 +30,10 @@ func reportFromRunReport(cfg Config, rep *RunReport) *Report {
 	out.BlocksTotal = uint64(len(rep.Slots))
 	out.AvgTPS = float64(rep.TotalTx) / out.DurationSec
 
-	// Budget-mode aggregates.
-	out.BudgetMode = true
+	// Budget-mode aggregates. Saturate mode runs without a slot clock,
+	// so there's no chain-realistic effective-max-TPS — only a raw
+	// hardware-ceiling number from total-tx ÷ wall-time.
+	out.BudgetMode = rep.SlotInterval > 0
 	out.BlockTimeMs = float64(rep.SlotInterval) / 1e6
 	out.BlockBudgetMs = float64(rep.BlockBudget) / 1e6
 	out.SlotsTotal = len(rep.Slots)
@@ -69,9 +71,13 @@ func reportFromRunReport(cfg Config, rep *RunReport) *Report {
 	out.TxPerBlockMin = fitMin
 	out.TxPerBlockMax = fitMax
 	out.TxPerBlockAvg = float64(fitSum) / float64(len(rep.Slots))
-	out.BlockBudgetUsedAvgPct = (float64(usedSum) / float64(len(rep.Slots)) / float64(rep.BlockBudget.Nanoseconds())) * 100
-	out.BlockBudgetUsedMaxPct = (float64(usedMax) / float64(rep.BlockBudget.Nanoseconds())) * 100
-	out.EffectiveMaxTPS = out.TxPerBlockAvg / rep.SlotInterval.Seconds()
+	if rep.BlockBudget > 0 {
+		out.BlockBudgetUsedAvgPct = (float64(usedSum) / float64(len(rep.Slots)) / float64(rep.BlockBudget.Nanoseconds())) * 100
+		out.BlockBudgetUsedMaxPct = (float64(usedMax) / float64(rep.BlockBudget.Nanoseconds())) * 100
+	}
+	if rep.SlotInterval > 0 {
+		out.EffectiveMaxTPS = out.TxPerBlockAvg / rep.SlotInterval.Seconds()
+	}
 
 	out.BlockTimeAvgMs = float64(usedSum/int64(len(rep.Slots))) / 1e6
 	out.BlockTimePeakMs = float64(usedMax) / 1e6
@@ -79,7 +85,7 @@ func reportFromRunReport(cfg Config, rep *RunReport) *Report {
 	out.SigVerifyIntakeMs = float64(rep.IntakeVerifyNs) / 1e6
 	out.ExecMs = float64(usedSum) / 1e6
 	out.PeakTPS = 0
-	if len(rep.Slots) > 0 {
+	if len(rep.Slots) > 0 && rep.SlotInterval > 0 {
 		// Per-slot peak TPS: max(TxFit) / SlotInterval. This is the
 		// best single-slot rate we observed.
 		out.PeakTPS = float64(fitMax) / rep.SlotInterval.Seconds()
