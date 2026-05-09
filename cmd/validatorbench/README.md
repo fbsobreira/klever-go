@@ -1,354 +1,173 @@
 # Klever Validator Throughput Benchmark
 
-`validatorbench` simulates a single-node validator processing a contract-heavy
-workload end-to-end: signed transactions are produced concurrently, queued in
-a mempool, batched into blocks, and executed through the **real** klever-go
-WASM VM (`wasmer2`) against the **real** state trie. The goal is to measure
-how many transactions per second and how many smart-contract calls per
-second the host CPU can sustain under realistic load — and to surface the
-specific phase that limits it.
+`validatorbench` measures how many transactions per second and how many
+smart-contract calls per second the production klever-go validator code
+path can sustain on a given host. **It does not re-implement any part
+of the validator pipeline — it wires up the real components and drives
+them.** When the validator team changes anything in `txProcessor`,
+`scProcessor`, or `preprocess.transactions`, this benchmark's numbers
+track the change automatically.
+
+## How it works (production-component reuse)
+
+A single `BenchNode` (`benchnode.go`) wires up the same components a
+real klever-go validator runs at startup, with consensus / BLS /
+messenger / slot-manager / nodes-coordinator stripped out:
+
+| Production component                           | Used as-is in the bench? |
+|------------------------------------------------|--------------------------|
+| `data/retriever/txpool.shardedTxPool`          | yes (production mempool) |
+| `data/state.AccountsDB` / `AccountsCacher`     | yes (production state)   |
+| `core/process/economics.EconomicsData`         | yes                      |
+| `core/process/block/postprocess.NewFeeAccumulator` | yes                  |
+| `eventNotifier/notifier.GasScheduleNotifier`   | yes (in-memory v1)       |
+| `core/kapp/kappController.NewKappController`   | yes                      |
+| `core/process/smartContract/builtInFunctions`  | yes (real container)     |
+| `core/process/smartContract/hooks.NewBlockChainHookImpl` | yes            |
+| `core/process/factory/chain.NewVMContainerFactory` (wasmer2) | yes        |
+| `core/process/smartContract.NewSmartContractProcessor` | yes (no mock)    |
+| `core/process/transaction.NewTxProcessor`      | yes                      |
+| `core/process/block/preprocess.NewTransactionPreprocessor` | yes          |
+
+A `BenchRunner` (`runner.go`) drives the slot clock + mempool intake +
+per-slot calls into the real preprocessor:
+
+```
+generator (BuildSignedTransfer / BuildSignedSCCall via BenchNode)
+   -> shardedTxPool.AddData                         [production intake]
+   -> preprocess.transactions
+        .CreateAndProcessBlockTransactions(blk, haveTime)
+                                                    [production block production]
+        -> transaction.txProcessor.ProcessTransaction
+        -> smartContract.scProcessor.ExecuteSmartContractTransaction
+        -> wasmer2 VM container
+   -> AccountsCacher commit
+```
+
+`haveTime` is the per-block CPU budget (klever mainnet: 500 ms). The
+slot clock is the chain block interval (klever mainnet: 4 s). Both are
+configurable.
 
 ## What it measures
 
-| Metric                                | Source                                            |
-|---------------------------------------|---------------------------------------------------|
-| Transactions per second               | `tx_total / wall_time`                            |
-| Smart-contract calls per second       | successful VM calls / wall_time                   |
-| Pure transfers per second             | balance-only path, no VM dispatch                 |
-| **Effective max TPS (budget mode)**   | `avg_tx_per_block / block_time`                   |
-| Tx per block under budget             | how many fit in `block_budget` ms                 |
-| Block processing time (avg/peak)      | per-block timer in `Processor.processBlock`        |
-| Hashing time as % of total            | wrapped `Hasher.Compute()` timer                  |
-| CPU usage (user + sys)                | `getrusage(RUSAGE_SELF)`                          |
-| Memory usage                          | `runtime.ReadMemStats()`                          |
-| Latency per transaction               | wall-clock around `RunSmartContractCall`          |
-| Cold-cache deploy + first-call        | per-contract first-touch timer in `VMEnv`         |
-| Failure / timeout rate                | VM `ReturnCode != Ok` divided by total            |
-
-## Two modes
-
-| Mode                      | Triggered by                              | Reports                                                |
-|---------------------------|-------------------------------------------|--------------------------------------------------------|
-| **Block-budget (default)**| `block_time` + `block_budget` set         | chain-realistic max TPS — txs per slot ÷ slot interval  |
-| **Raw burst**             | `--block-time 0 --block-budget 0`         | host CPU ceiling (TPS as fast as possible)              |
-
-The defaults match klever mainnet: **4 s block interval, 500 ms per-block
-CPU budget for all transaction types**. Override with `--block-time` /
-`--block-budget` if your chain uses different values. Set both to `0` to
-get the as-fast-as-possible burst number instead.
-
-In budget mode the processor mimics what a validator does: produce one
-block every `block_time`, spend at most `block_budget` of CPU on it,
-ship it to consensus, and leave overflow in the mempool. The headline
-output is **EFFECTIVE MAX TPS** — what consensus actually sees on a
-saturated chain.
-
-Signature verification happens at mempool intake (parallel, in the
-generator goroutines), exactly as a real validator does it from the P2P
-ingress path. **It does not consume the per-block budget.** The 500 ms
-window is spent only on tx execution, state updates, and block
-finalisation.
-
-To make the test honest you want the mempool overloaded, not starved:
-pre-generate enough txs with `--prefill 30000` (or whatever value beats
-your block size).
-
-## Configurable transactions and contracts
-
-The benchmark accepts an arbitrary mix of tx types and contracts via
-the `tx_mix` array in the JSON config. Each entry sets a `weight`
-(relative selection probability) and the fields it needs:
-
-```json
-{
-  "tx_mix": [
-    { "type": "transfer", "weight": 4, "value": 1 },
-    {
-      "type": "sc-call",
-      "weight": 1,
-      "contract_path": "testdata/adder.wasm",
-      "init_args": ["5"],
-      "function": "add",
-      "call_args": ["1"],
-      "instances": 2
-    }
-  ]
-}
-```
-
-The engine deploys every contract referenced in the mix at startup,
-funds the owner + sender accounts, and the mix workload picks among
-entries by weight on every tx. Add as many entries as you like — the
-mix is the single mechanism for "specify what transactions and what
-smart contracts to test in the benchmark tool start". Simple-mode
-flags (`--workload`, `--contract`, `--call`) still work and translate
-internally to a one-entry mix.
-
-## How "real" it really is
-
-* **Real VM:** `kvm/wasmer2` (CGO) + `kvm/scenarioexec.VMTestExecutor`. Same
-  host, same gas schedule, same builtin functions a validator uses.
-* **Real state:** every successful tx commits its `OutputAccounts` back to
-  the in-memory accounts trie (`MockWorld`), including code-hash updates and
-  storage writes.
-* **Real signatures:** `crypto/ed25519` signing + verification on every tx.
-* **Real hashing:** `crypto/hashing/{blake2b,keccak,sha256}`, selected at
-  runtime, instrumented with byte/duration counters.
-* **Real serialisation:** transactions are marshalled into bytes and re-fed
-  through the hasher just like the P2P inbound path does.
-
-## What it does NOT do
-
-* Drive a libp2p socket — the cost is included only as marshal/hash work.
-* Run consensus or BLS aggregation — those phases are validator-set sized,
-  not single-node sized, and don't reflect the per-node CPU ceiling we care
-  about here.
-
-If you need network or consensus numbers, layer them on top: this tool gives
-you the per-block CPU + IO + memory budget.
-
----
+| Metric                                | Source                                              |
+|---------------------------------------|-----------------------------------------------------|
+| **Effective max TPS**                 | `avg_tx_per_slot / slot_interval`                   |
+| Tx per block (avg/min/max)            | per-slot count from `preprocessor` return            |
+| Budget used (avg/max)                 | wall time of preprocessor call ÷ configured budget   |
+| Slot count (total/empty)              | filled vs starved slots                              |
+| Block processing time (avg/peak)      | wall time of `CreateAndProcessBlockTransactions`     |
+| Intake verify (off-budget)            | wall time of generator's tx-build path               |
+| Bottleneck classification             | budget-saturated vs starved vs balanced              |
 
 ## Build
 
 ```bash
-# from the repo root
 make build-benchmark-throughput
-
-# or directly
+# or
 LD_LIBRARY_PATH=$(pwd)/kvm/wasmer2 \
   go build -o bin/validatorbench ./cmd/validatorbench
 ```
 
-The `wasmer2` runtime is a shared library (`libvmexeccapi.so`); set
-`LD_LIBRARY_PATH` (Linux) or `DYLD_LIBRARY_PATH` (macOS) when running.
-
-## Quick start
+## Run
 
 ```bash
-# 30-second sc-call run with the bundled adder.wasm contract
+# Pure transfer workload (no VM dispatch)
 LD_LIBRARY_PATH=$(pwd)/kvm/wasmer2 \
   ./bin/validatorbench \
+    --workload transfer \
     --duration 30s \
+    --prefill 30000 \
+    --concurrency 4 \
+    --accounts 200
+
+# SC-call workload (real wasmer2 VM)
+LD_LIBRARY_PATH=$(pwd)/kvm/wasmer2 \
+  ./bin/validatorbench \
     --workload sc-call \
-    --hash blake2b
+    --contract ./cmd/validatorbench/testdata/adder.wasm \
+    --call add \
+    --duration 30s \
+    --prefill 5000 \
+    --concurrency 4 \
+    --accounts 200 \
+    --contracts 2 \
+    --gas-limit 1500000
 ```
 
-### Run with a JSON config
+The bench prints a text summary to stdout and writes JSON + CSV to
+`--output-dir` (default `./bench-results`).
 
-```bash
-./bin/validatorbench --config cmd/validatorbench/config.example.json
-```
+## Configuration
 
-CLI flags override values from the JSON file, so `--duration 60s` on top of
-the example config wins.
+The default block timing matches klever mainnet:
 
-### Budget mode (the chain-realistic number)
+| Field          | Default | Note                                  |
+|----------------|---------|---------------------------------------|
+| `block_time`   | `4s`    | slot interval                          |
+| `block_budget` | `500ms` | max CPU time per block                 |
 
-Budget mode is on by default — 4 s block interval, 500 ms per-block CPU
-budget. Pre-fill the mempool so the validator pipeline is permanently
-overloaded:
+Override via `--block-time` / `--block-budget` for other chain configs.
+Setting both to `0` runs as-fast-as-possible (raw burst mode, not
+chain-realistic).
 
-```bash
-# Pure-transfer budget run (no VM)
-./bin/validatorbench \
-  --workload transfer --warmup 0 \
-  --prefill 30000 --block-size 30000 \
-  --duration 30s
+## Configurable transactions and contracts
 
-# SC-call budget run
-./bin/validatorbench \
-  --workload sc-call --warmup 0 \
-  --prefill 5000 --block-size 5000 \
-  --duration 30s
+The simple-mode flags select between two workloads:
 
-# Mixed (transfers + multiple contracts)
-./bin/validatorbench --config cmd/validatorbench/config.example.json
-```
+- `--workload transfer` — KLV transfers between accounts (no VM)
+- `--workload sc-call` — invoke `--call` on `--contracts` instances of
+  the `--contract` wasm file
 
-The "Block-budget mode" section of the report tells you exactly how
-many txs fit in each 500 ms window, the budget utilisation, and the
-effective max TPS. That's the number to size validator capacity
-against.
+Both workloads build real `*data/transaction.Transaction` protobufs,
+sign them with ed25519, push them through the production
+`shardedTxPool.AddData` path, and let the production preprocessor
+select + execute them per slot.
 
-### Custom contracts
+For SC workloads:
+- `--contracts N` deploys N independent instances of the wasm at startup
+  (each deploy is its own block through the production preprocessor)
+- `--call FN --gas-limit G` invokes function `FN` with gas budget `G`
+- `--init-args` / `--call-args` pass arguments (decimal → bigint, hex
+  with `0x` prefix → raw bytes)
 
-Drop your `.wasm` next to (or anywhere reachable from) the binary, then
-either point `--contract path.wasm --call myFn` (simple mode) or write
-a `tx_mix` entry per contract (mix mode). The benchmark deploys it
-once at startup, funds the calling accounts, and runs your function
-with the configured arguments. Argument templates support:
+## Sample output
 
-- decimal literals: `"5"` → big-endian bigint
-- hex literals: `"0xfeed"` → raw bytes
-- random tokens: `"rand:8"` → 8 fresh random bytes per call
+See [sample-output.txt](./sample-output.txt) for a captured run.
 
-### Cold-cache costs
+Test-VM numbers (4 CPUs, in-memory state, blake2b):
 
-Run a tiny `--tx 5 --warmup 0` to surface the deploy and first-call
-latencies. They're paid once per contract per process restart and they
-dominate the worst-case block.
+| Workload   | Tx/block (avg) | Budget used | Effective TPS |
+|------------|----------------|-------------|---------------|
+| transfer   | ~3 700         | 100 %       | ~925          |
+| sc-call (adder, gasLimit=1.5M) | ~945  | 53 %  | ~236          |
 
-### Compare SHA hardware acceleration
+Mainnet hardware (more CPUs, NVMe-backed LevelDB, larger gas budget per
+block) will run faster — these are reference numbers from a 4-CPU VM
+with in-memory state.
 
-`--compare-sha` runs the benchmark twice — once with the default Go hash
-backend (which uses Intel SHA-NI / ARMv8-CE if present) and once with the
-hardware path forcibly disabled via `GODEBUG`. The comparative summary
-shows the throughput, hash-time, and CPU deltas.
+## Constraints + notes
 
-```bash
-./bin/validatorbench --compare-sha --duration 20s --hash sha256
-```
+- **Budget over-run**: my deadline check happens between txs. A single
+  outlier tx that takes 50+ ms can push a block past the 500 ms
+  budget. On a real validator that means the slot is missed; the bench
+  surfaces it as `Budget used: max > 100%`.
 
-The two child runs are spawned with `os.Executable()`, so the binary must be
-on disk (running under `go run` won't reach the re-exec path).
+- **SC gas budget cap**: the production preprocessor admits txs into a
+  block while their declared `gasLimit` total stays under
+  `MaxGasPerBlock` (default 1.5 B). With `--gas-limit 5000000` you cap
+  at 300 SC calls per block by gas alone; lower `--gas-limit` to fit
+  more.
 
-### Disable HW SHA without compare mode
+- **No bench-side metrics for hashing / latency / CPU**: those came
+  from the legacy parallel flow. The production preprocessor does not
+  expose per-tx instrumentation hooks; numbers in those Report fields
+  read 0. The text summary section "Phase breakdown" still shows the
+  exec time (the real preprocessor wall time) and intake verify (the
+  generator's sig-build cost), which is what matters for sizing.
 
-```bash
-./bin/validatorbench --sha-hardware off --duration 20s --hash sha256
-```
-
-This re-execs the binary once with `GODEBUG=cpu.sha=off,...` so the runtime
-disables the SHA-NI fast path before `crypto/sha256` is initialised.
-
----
-
-## CLI flags
-
-```
---config string         path to JSON config file (CLI flags override config values)
---workload string       workload name (sc-call|transfer|mixed)
---contract string       path to .wasm contract file
---call string           contract function to invoke
---tx int                total number of transactions to send (0 = use --duration)
---contracts int         number of contract instances to deploy
---accounts int          size of the funded sender pool
---block-size int        transactions per block
---concurrency int       concurrent generators / verifiers (default: NumCPU)
---duration duration     test duration (e.g. 30s, 5m)
---hash string           hash algorithm (sha256|blake2b|keccak)
---sha-hardware string   auto|off (off re-execs with GODEBUG to disable HW SHA)
---output-dir string     directory for JSON/CSV reports
---complexity int        contract complexity multiplier (calls per tx)
---gas-limit uint64      gas limit per transaction
---gas-price uint64      gas price per gas unit
---tx-padding int        extra bytes appended to each tx data field
---warmup int            warm-up transactions (0 to disable)
---verbose               enable verbose internal logging
---json                  force-enable JSON report
---csv                   force-enable CSV report
---compare-sha           run twice (HW SHA on/off) and emit a comparative summary
---block-time duration   chain slot interval (e.g. 3s); enables budget mode together with --block-budget
---block-budget duration max processing time per block (e.g. 500ms); the headline EFFECTIVE MAX TPS comes from this
---prefill int           transactions to pre-generate into the mempool before timing starts (recommended in budget mode)
---version               print version and exit
-```
-
-## Configuration reference
-
-See `config.example.json` for an annotated example. Fields:
-
-| Field                       | Type        | Notes                                              |
-|-----------------------------|-------------|----------------------------------------------------|
-| `workload`                  | string      | `sc-call`, `transfer`, `mixed`                      |
-| `contract_path`             | string      | path to `.wasm` file (relative to cwd)              |
-| `init_args`                 | []string    | constructor args (decimal / hex `0x..` / raw)       |
-| `call_function`             | string      | exported function called for `sc-call` workload     |
-| `call_args`                 | []string    | per-call args; `rand:N` produces N fresh bytes      |
-| `num_transactions`          | int         | tx budget; 0 means "use duration only"              |
-| `num_contracts`             | int         | distinct contract instances deployed                |
-| `num_accounts`              | int         | funded sender pool                                   |
-| `block_size`                | int         | tx per block                                        |
-| `concurrency`               | int         | generator + verifier workers (0 = NumCPU)           |
-| `duration`                  | string      | Go duration (`30s`, `5m`)                            |
-| `contract_complexity`       | int         | multiplies the per-tx argument repetition           |
-| `hash_algorithm`            | string      | `sha256`, `blake2b`, `keccak`                       |
-| `sha_hardware`              | string      | `auto` or `off`                                     |
-| `tx_data_padding_bytes`     | int         | bytes of pseudo-random padding per tx                |
-| `gas_limit`, `gas_price`    | uint64      | per-tx                                              |
-| `initial_balance`           | int64       | KLV base units credited to every account            |
-| `output_dir`                | string      | created if missing                                  |
-| `json_report`/`csv_report`  | bool        | enable each report file                             |
-| `progress_interval_seconds` | int         | stderr ticker (0 disables)                           |
-| `warmup_transactions`       | int         | un-timed pre-roll                                   |
-| `compare_sha`               | bool        | runs HW-on then HW-off back-to-back                  |
-| `block_time`                | string      | chain slot interval (`3s`, `4s`); enables budget mode |
-| `block_budget`              | string      | max CPU time per block (`500ms`); requires block_time |
-| `prefill_mempool`           | int         | txs to pre-generate before timing starts (overload)   |
-
-## Output
-
-`validatorbench` always prints a human-readable summary to **stdout**.
-When `--json` and/or `--csv` are enabled it also writes
-`report-YYYYMMDD-HHMMSS.json` / `.csv` into `--output-dir`.
-
-The JSON file contains the full `Report` struct, including the merged
-config and the system info, so it's safe to commit alongside performance
-regression baselines.
-
-A typical text summary looks like the [sample-output.txt](./sample-output.txt)
-in this directory.
-
----
-
-## Adding a new workload
-
-`Workload` is a one-method interface:
-
-```go
-type Workload interface {
-    Name() string
-    Next(workerID int) *Tx
-}
-```
-
-1. Implement it in a new `.go` file under this directory.
-2. Register a constructor in an `init()` block:
-
-   ```go
-   func init() {
-       RegisterWorkload("my-workload", newMyWorkload)
-   }
-   ```
-
-3. Reference it via `--workload my-workload` or `"workload": "my-workload"`
-   in JSON.
-
-The constructor receives the parsed `Config`, the prepared `VMEnv` (so it
-can pick senders / contract addresses), and the `TxBuilder` (for signing).
-Return any non-nil error to abort the run before timing starts.
-
-## How the pieces fit
-
-```
-generators ──push──▶ Mempool ──drain──▶ Processor ──per-block──┐
-   ▲                                       │                   │
-   └── workload.Next(workerID)             │  parallel sig verify
-                                           │  sequential VM exec
-                                           │  block finalize hash
-                                           ▼
-                                       Metrics  ──▶ Report (JSON/CSV/text)
-```
-
-* `cmd/validatorbench/vmenv.go` — bootstraps `MockWorld`, funds accounts,
-  deploys contracts.
-* `cmd/validatorbench/processor.go` — the only goroutine that touches
-  the VM (deterministic, mirrors validator behaviour).
-* `cmd/validatorbench/metrics.go` — atomic counters + reservoir latency
-  histogram + CPU/mem snapshots at end.
-* `cmd/validatorbench/hashing.go` — wraps the chosen `klever-go` hasher
-  to time every `Compute()` call.
-
-## Caveats
-
-* Signature **verification** runs inside `processBlock` so the cost is
-  attributed to block time. If you split that into a dedicated mempool
-  pre-screen, copy the timer block.
-* `MockWorld` keeps storage in RAM; on production validators the same
-  state lives in LevelDB. Real disk pressure adds ~10-30% overhead on
-  hot SC calls. Use `cmd/benchmark` (the existing host benchmark) for
-  the disk side.
-* The `transfer` workload still calls into the VM (with a noop function)
-  so its TPS reflects "validation pipeline overhead" rather than a
-  pure value-transfer ceiling.
+- **Genesis-mode SC processor**: the production scProcessor refuses
+  direct deploys outside genesis (real chain deploys go through the
+  proposal mechanism). The bench runs the SC processor in genesis
+  mode end-to-end so it can deploy contracts on demand. This does
+  not affect transfer or invoke behavior.
