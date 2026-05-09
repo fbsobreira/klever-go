@@ -59,3 +59,11 @@ report.json
 
 # validator throughput benchmark output (--output-dir defaults under cwd)
 bench-results/
+
+# stray binaries from `go build ./cmd/<name>` without -o (lands at repo root)
+/validatorbench
+/benchmark
+/seednode
+/operator
+/keygenerator
+/validator
