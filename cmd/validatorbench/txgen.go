@@ -55,6 +55,13 @@ type Tx struct {
 
 	// Signature is the ed25519 signature over SHA-256(SigBody).
 	Signature []byte
+
+	// Verified is set to true once the mempool intake path (or the
+	// generator's verifyAndPush helper) has confirmed the signature.
+	// The block processor never re-verifies; that's the whole point of
+	// having a mempool — verification is amortised at intake so the per-
+	// block budget can be spent on execution.
+	Verified bool
 }
 
 // TxBuilder marshals + signs transactions. It is safe to share between

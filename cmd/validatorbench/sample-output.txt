@@ -1,51 +1,45 @@
-  ... 2s elapsed | tx=791 (failed=0) | 395 tx/s
-  ... 4s elapsed | tx=2007 (failed=0) | 502 tx/s
-  ... 6s elapsed | tx=2007 (failed=0) | 334 tx/s
-  ... 8s elapsed | tx=3142 (failed=0) | 393 tx/s
-  ... 10s elapsed | tx=4270 (failed=0) | 427 tx/s
 ==========================================================
  Klever Validator Throughput Benchmark
 ==========================================================
- Generated:    2026-05-09T10:43:21Z
+ Generated:    2026-05-09T11:15:48Z
  Host:         vm (linux/amd64, 4 CPUs, go1.25.0)
- Workload:     sc-call
+ Workload:     transfer
  Contract:     testdata/adder.wasm
  Hash algo:    blake2b (HW accel: avail=false used=false — blake2b has no dedicated HW path on this platform)
- Block size:   5000   Concurrency: 4
- Duration:     12s   Wall:        11.94s
+ Block size:   80000   Concurrency: 4
+ Duration:     12s   Wall:        9.87s
 ----------------------------------------------------------
  Throughput
-   Transactions:  4270 total, 0 failed (0.00% fail)
-   Avg TPS:       357.6       Peak TPS:    406.7
-   Avg SC/s:      357.6       Peak SC/s:   577.2
-   Blocks:        4 (avg 476.17 ms, peak 476.49 ms)
+   Transactions:  67695 total, 0 failed (0.00% fail)
+   Avg TPS:       6861.2       Peak TPS:    5846.9
+   Avg SC/s:      0.0       Peak SC/s:   0.0
+   Avg Transfer/s: 6861.2      Transfers OK/Fail: 67695/0
+   Blocks:        3 (avg 528.54 ms, peak 578.13 ms)
  Latency
-   avg 0.435 ms | p50 0.370 | p95 0.499 | p99 0.709 | max 19.879
+   avg 0.018 ms | p50 0.009 | p95 0.036 | p99 0.090 | max 60.822
  Phase breakdown (cumulative across run)
-   Sig verify:    30.22 ms (1.6%)
-   VM execution:  1870.83 ms (98.2%)
-   Finalize:      3.62 ms (0.2%)
-   Hashing:       30.54 ms (1.6% of total)
-   Hashes:        37080 (4.35 MB hashed)
+   Intake verify:   32762.75 ms (off-budget; mempool path)
+   --- on the per-block CPU budget ---
+   Tx execution:    1437.42 ms (90.7%)
+   Block finalize:  148.21 ms (9.3%)
+   Hashing:       323.59 ms (20.4% of total)
+   Hashes:        203085 (26.08 MB hashed)
  System
-   CPU user/sys:  3.40s / 0.30s (~31.0% of single core)
-   Heap:          58.90 MB    Sys: 90.25 MB    GC cycles: 16
+   CPU user/sys:  38.59s / 0.35s (~394.7% of single core)
+   Heap:          338.45 MB    Sys: 361.52 MB    GC cycles: 11
 ----------------------------------------------------------
  Cold-cache costs (paid once per process restart per contract)
-   Deploy:            1 contracts, avg 2.61 ms, max 2.61 ms
-   First call:        1 contracts, avg 0.361 ms, min 0.361 ms, max 0.361 ms
+   Deploy:            1 contracts, avg 3.65 ms, max 3.65 ms
 ----------------------------------------------------------
  Block-budget mode (chain-realistic ceiling)
-   Block time:        3000 ms (slot interval)
+   Block time:        4000 ms (slot interval)
    Block budget:      500 ms (max processing time per block)
-   Slots:             4 total, 0 empty (mempool starved)
-   Tx per block:      avg 1067.5, min 791, max 1216
-   Budget used:       avg 95.2%, max 95.3%
-   EFFECTIVE MAX TPS: 356 tx/s (1067.5 tx/block ÷ 3.0s)
+   Slots:             3 total, 0 empty (mempool starved)
+   Tx per block:      avg 22565.0, min 14788, max 29532
+   Budget used:       avg 105.7%, max 115.6%
+   EFFECTIVE MAX TPS: 5641 tx/s (22565.0 tx/block ÷ 4.0s)
 ----------------------------------------------------------
  Summary
    Bottleneck:        VM execution (smart contract dispatch dominates)
-   Validator impact:  Marginal — investigate before promoting to producer node
+   Validator impact:  Excellent — sustains high-throughput chain workloads
 ==========================================================
-JSON report:  /tmp/cold/report-20260509-104321.json
-CSV report:   /tmp/cold/report-20260509-104321.csv

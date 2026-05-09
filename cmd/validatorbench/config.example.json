@@ -1,18 +1,12 @@
 {
-  "workload": "sc-call",
-  "contract_path": "testdata/adder.wasm",
-  "init_args": ["5"],
-  "call_function": "add",
-  "call_args": ["1"],
-
-  "num_transactions": 0,
-  "num_contracts": 4,
   "num_accounts": 64,
-  "block_size": 200,
+  "block_size": 30000,
   "concurrency": 0,
   "duration": "30s",
 
-  "contract_complexity": 1,
+  "block_time": "4s",
+  "block_budget": "500ms",
+  "prefill_mempool": 30000,
 
   "hash_algorithm": "blake2b",
   "sha_hardware": "auto",
@@ -28,10 +22,23 @@
   "verbose": false,
   "progress_interval_seconds": 2,
 
-  "warmup_transactions": 200,
+  "warmup_transactions": 0,
   "compare_sha": false,
 
-  "block_time": "3s",
-  "block_budget": "500ms",
-  "prefill_mempool": 5000
+  "tx_mix": [
+    {
+      "type": "transfer",
+      "weight": 4,
+      "value": 1
+    },
+    {
+      "type": "sc-call",
+      "weight": 1,
+      "contract_path": "testdata/adder.wasm",
+      "init_args": ["5"],
+      "function": "add",
+      "call_args": ["1"],
+      "instances": 2
+    }
+  ]
 }

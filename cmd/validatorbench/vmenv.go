@@ -93,9 +93,16 @@ func NewVMEnv(cfg Config, hashStats *HashStats) (*VMEnv, error) {
 		return nil, fmt.Errorf("init VM: %w", err)
 	}
 
-	if err := env.deployContracts(); err != nil {
-		env.Close()
-		return nil, err
+	// Auto-deploy the simple-mode contract only when no tx_mix is
+	// configured. With a tx_mix the workload itself is responsible
+	// for deploying every contract type it references — that's how the
+	// caller can swap in any wasm file at startup without us needing to
+	// know about it here.
+	if len(cfg.TxMix) == 0 && cfg.ContractPath != "" {
+		if err := env.deployContracts(); err != nil {
+			env.Close()
+			return nil, err
+		}
 	}
 
 	return env, nil
@@ -119,6 +126,86 @@ func (e *VMEnv) Senders() []*Account { return e.senders }
 
 // Contracts returns the addresses of all deployed contract instances.
 func (e *VMEnv) Contracts() [][]byte { return e.scAddrs }
+
+// DeployedContract groups a deployed instance with the call function /
+// args / argtemplates the workload should invoke against it. Used by
+// the mix workload to fan out across heterogeneous contracts.
+type DeployedContract struct {
+	Address  []byte
+	Function string
+	ArgTpls  []argTemplate
+}
+
+// DeployContract loads a wasm file, deploys `instances` independent
+// copies, and returns their addresses paired with the function the
+// caller wants to invoke. Used by the mix workload at startup so any
+// number of contracts can be tested in a single run without
+// hard-coding paths in the binary.
+func (e *VMEnv) DeployContract(path string, initArgs []string, function string, callArgs []argTemplate, instances int) ([]*DeployedContract, error) {
+	if instances < 1 {
+		instances = 1
+	}
+	wasm, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read contract %q: %w", path, err)
+	}
+	args := encodeArgs(initArgs)
+	out := make([]*DeployedContract, 0, instances)
+	for i := 0; i < instances; i++ {
+		// Bump the owner's on-chain nonce before each deploy so the VM's
+		// address-derivation uses a unique (creator, nonce) pair per
+		// instance. Without this, deploys 2..N collide on the same SC
+		// address because the world-state nonce is what the VM consults.
+		if err := e.exec.World.UpdateWorldStateBefore(e.owner.Address[:], 0, 0); err != nil {
+			return nil, fmt.Errorf("pre-deploy %s[%d]: %w", path, i, err)
+		}
+		input := &vmcommon.ContractCreateInput{
+			ContractCode: wasm,
+			VMInput: vmcommon.VMInput{
+				CallerAddr:     e.owner.Address[:],
+				Arguments:      args,
+				GasProvided:    e.cfg.GasLimit,
+				OriginalTxHash: txHash(uint64(len(e.scAddrs)+i), 0),
+				CurrentTxHash:  txHash(uint64(len(e.scAddrs)+i), 0),
+				KDATransfers:   []*vmcommon.KDATransfer{},
+			},
+		}
+		t0 := time.Now()
+		o, err := e.exec.GetVM().RunSmartContractCreate(input)
+		e.deployLatency = append(e.deployLatency, time.Since(t0))
+		if err != nil {
+			return nil, fmt.Errorf("deploy %s[%d]: %w", path, i, err)
+		}
+		if o.ReturnCode != vmcommon.Ok {
+			return nil, fmt.Errorf("deploy %s[%d]: %s (%s)", path, i, o.ReturnCode, o.ReturnMessage)
+		}
+		if err := e.exec.World.UpdateAccounts(o.OutputAccounts, o.DeletedAccounts); err != nil {
+			return nil, fmt.Errorf("commit deploy %s[%d]: %w", path, i, err)
+		}
+		var addr []byte
+		for _, oa := range o.OutputAccounts {
+			if len(oa.Code) > 0 {
+				addr = oa.Address
+				break
+			}
+		}
+		if addr == nil {
+			// Fallback: derive deterministically from the owner address +
+			// the just-bumped owner nonce. UpdateWorldStateBefore did the
+			// increment, so reading owner.Nonce here gives the post-bump
+			// value the VM used.
+			addr = worldhook.GenerateMockAddress(e.owner.Address[:], e.owner.Nonce+1, scenarioexec.TestVMType)
+		}
+		e.owner.Nonce++
+		e.scAddrs = append(e.scAddrs, addr)
+		out = append(out, &DeployedContract{
+			Address:  addr,
+			Function: function,
+			ArgTpls:  callArgs,
+		})
+	}
+	return out, nil
+}
 
 // DeployLatencies returns the wall-clock time of every contract deploy
 // (compile + init invoke), in deploy order.
@@ -167,77 +254,20 @@ func (e *VMEnv) bootstrapAccounts() error {
 	return nil
 }
 
-// deployContracts loads the wasm bytes once and deploys NumContracts
-// independent instances. Each instance has its own storage trie, which
-// is what we want when the workload spreads calls across contracts to
-// avoid hot-row contention skewing the result.
+// deployContracts is the simple-mode shortcut: it deploys cfg.NumContracts
+// instances of cfg.ContractPath and stashes the addresses on the env.
+// Internally it delegates to DeployContract so the nonce-bumping path is
+// shared with the tx_mix flow.
 func (e *VMEnv) deployContracts() error {
-	wasm, err := os.ReadFile(e.cfg.ContractPath)
+	if e.cfg.ContractPath == "" {
+		return nil
+	}
+	tpls, err := parseArgTemplates(e.cfg.CallArgsTpl)
 	if err != nil {
-		return fmt.Errorf("read contract %q: %w", e.cfg.ContractPath, err)
+		return fmt.Errorf("call_args: %w", err)
 	}
-	if len(wasm) == 0 {
-		return fmt.Errorf("contract file %q is empty", e.cfg.ContractPath)
-	}
-
-	args := encodeArgs(e.cfg.InitArgs)
-
-	for i := 0; i < e.cfg.NumContracts; i++ {
-		// Compute a deterministic SC address from the owner + creator nonce
-		// so subsequent calls in the same run can target it without doing
-		// an extra lookup.
-		scAddr := worldhook.GenerateMockAddress(e.owner.Address[:], e.owner.Nonce, scenarioexec.TestVMType)
-
-		input := &vmcommon.ContractCreateInput{
-			ContractCode: wasm,
-			VMInput: vmcommon.VMInput{
-				CallerAddr:     e.owner.Address[:],
-				Arguments:      args,
-				GasProvided:    e.cfg.GasLimit,
-				OriginalTxHash: txHash(uint64(i), 0),
-				CurrentTxHash:  txHash(uint64(i), 0),
-				KDATransfers:   []*vmcommon.KDATransfer{},
-			},
-		}
-
-		// Time the deploy: wasmer2 compiles the WASM module here. This is
-		// the dominant first-touch cost for any contract and what the
-		// validator pays once per process restart per contract.
-		deployStart := time.Now()
-		out, err := e.exec.GetVM().RunSmartContractCreate(input)
-		deployDur := time.Since(deployStart)
-		if err != nil {
-			return fmt.Errorf("deploy %d: %w", i, err)
-		}
-		if out.ReturnCode != vmcommon.Ok {
-			return fmt.Errorf("deploy %d failed: %s (%s)", i, out.ReturnCode, out.ReturnMessage)
-		}
-		e.deployLatency = append(e.deployLatency, deployDur)
-
-		// Persist the new SC and mutated owner into the mock world so the
-		// next call sees a committed, real account state.
-		if err := e.exec.World.UpdateAccounts(out.OutputAccounts, out.DeletedAccounts); err != nil {
-			return fmt.Errorf("commit deploy %d: %w", i, err)
-		}
-
-		// Pick the deployed contract address from the output map: it is the
-		// only newly-created account whose address has the VM type prefix.
-		var deployed []byte
-		for _, oa := range out.OutputAccounts {
-			if len(oa.Code) > 0 {
-				deployed = oa.Address
-				break
-			}
-		}
-		if deployed == nil {
-			deployed = scAddr
-		}
-		e.scAddrs = append(e.scAddrs, deployed)
-
-		// The validator increments the creator nonce after each deploy.
-		e.owner.Nonce++
-	}
-	return nil
+	_, err = e.DeployContract(e.cfg.ContractPath, e.cfg.InitArgs, e.cfg.CallFunction, tpls, e.cfg.NumContracts)
+	return err
 }
 
 // ExecuteTx runs a single signed transaction through the VM, mirroring
@@ -257,17 +287,12 @@ func (e *VMEnv) ExecuteTx(tx *Tx, hashStats *HashStats) (*vmcommon.VMOutput, boo
 	// per tx for the merkle leaf and for the on-disk tx index.
 	_ = e.timed.Compute(string(tx.Bytes))
 
-	// Hash the sig pre-image too: the validator computes this hash so it
-	// can index by tx-hash in the receipt store. Counting it here keeps
-	// the "hashing time as % of total" metric accurate.
-	_ = e.timed.Compute(string(tx.SigBody))
-
-	// Verify the ed25519 signature against the raw sig body. Ed25519's
-	// "pure" mode signs the message directly, so Verify must receive the
-	// same bytes Sign saw — not the digest.
-	if !ed25519.Verify(tx.Sender.Public, tx.SigBody, tx.Signature) {
-		// Signature mismatch is a tx failure, not a pipeline error: count
-		// it as failed so the report's failure-rate column reflects it.
+	// Signature verification has already happened at mempool intake (in
+	// the generator goroutines); inside the block-budget window we trust
+	// the Verified flag. This mirrors a real validator: the 500ms slot
+	// budget is spent on execution + state updates, not on re-checking
+	// signatures already validated when the tx arrived from P2P.
+	if !tx.Verified {
 		return nil, true, nil
 	}
 

@@ -29,18 +29,60 @@ specific phase that limits it.
 
 | Mode                      | Triggered by                              | Reports                                                |
 |---------------------------|-------------------------------------------|--------------------------------------------------------|
-| **Raw burst (default)**   | no `--block-time`/`--block-budget`        | host CPU ceiling (TPS as fast as possible)              |
-| **Block-budget**          | `--block-time 3s --block-budget 500ms`    | chain-realistic max TPS — txs per slot ÷ slot interval  |
+| **Block-budget (default)**| `block_time` + `block_budget` set         | chain-realistic max TPS — txs per slot ÷ slot interval  |
+| **Raw burst**             | `--block-time 0 --block-budget 0`         | host CPU ceiling (TPS as fast as possible)              |
 
-In budget mode the processor mimics what a klever-go validator does: it
-produces one block every `--block-time` and has at most `--block-budget`
-of CPU time to select, verify, execute, and finalise it. Whatever doesn't
-fit is left in the mempool. The headline number is **EFFECTIVE MAX TPS**
-— what consensus actually sees on a saturated chain.
+The defaults match klever mainnet: **4 s block interval, 500 ms per-block
+CPU budget for all transaction types**. Override with `--block-time` /
+`--block-budget` if your chain uses different values. Set both to `0` to
+get the as-fast-as-possible burst number instead.
+
+In budget mode the processor mimics what a validator does: produce one
+block every `block_time`, spend at most `block_budget` of CPU on it,
+ship it to consensus, and leave overflow in the mempool. The headline
+output is **EFFECTIVE MAX TPS** — what consensus actually sees on a
+saturated chain.
+
+Signature verification happens at mempool intake (parallel, in the
+generator goroutines), exactly as a real validator does it from the P2P
+ingress path. **It does not consume the per-block budget.** The 500 ms
+window is spent only on tx execution, state updates, and block
+finalisation.
 
 To make the test honest you want the mempool overloaded, not starved:
-pre-generate enough txs with `--prefill 5000` (or whatever value beats
+pre-generate enough txs with `--prefill 30000` (or whatever value beats
 your block size).
+
+## Configurable transactions and contracts
+
+The benchmark accepts an arbitrary mix of tx types and contracts via
+the `tx_mix` array in the JSON config. Each entry sets a `weight`
+(relative selection probability) and the fields it needs:
+
+```json
+{
+  "tx_mix": [
+    { "type": "transfer", "weight": 4, "value": 1 },
+    {
+      "type": "sc-call",
+      "weight": 1,
+      "contract_path": "testdata/adder.wasm",
+      "init_args": ["5"],
+      "function": "add",
+      "call_args": ["1"],
+      "instances": 2
+    }
+  ]
+}
+```
+
+The engine deploys every contract referenced in the mix at startup,
+funds the owner + sender accounts, and the mix workload picks among
+entries by weight on every tx. Add as many entries as you like — the
+mix is the single mechanism for "specify what transactions and what
+smart contracts to test in the benchmark tool start". Simple-mode
+flags (`--workload`, `--contract`, `--call`) still work and translate
+internally to a one-entry mix.
 
 ## How "real" it really is
 
@@ -103,28 +145,43 @@ the example config wins.
 
 ### Budget mode (the chain-realistic number)
 
-Run with klever-go's actual slot timing (3 s blocks, 500 ms budget) and
-a prefilled mempool so the validator pipeline is permanently overloaded:
+Budget mode is on by default — 4 s block interval, 500 ms per-block CPU
+budget. Pre-fill the mempool so the validator pipeline is permanently
+overloaded:
 
 ```bash
-# SC-call budget run
-./bin/validatorbench \
-  --workload sc-call --warmup 0 \
-  --block-time 3s --block-budget 500ms \
-  --prefill 5000 --block-size 5000 \
-  --duration 30s
-
 # Pure-transfer budget run (no VM)
 ./bin/validatorbench \
   --workload transfer --warmup 0 \
-  --block-time 4s --block-budget 500ms \
   --prefill 30000 --block-size 30000 \
   --duration 30s
+
+# SC-call budget run
+./bin/validatorbench \
+  --workload sc-call --warmup 0 \
+  --prefill 5000 --block-size 5000 \
+  --duration 30s
+
+# Mixed (transfers + multiple contracts)
+./bin/validatorbench --config cmd/validatorbench/config.example.json
 ```
 
-The "Block-budget mode" section of the report tells you exactly how many
-txs fit in each 500 ms window, the budget utilisation, and the effective
-max TPS. That's the number to size validator capacity against.
+The "Block-budget mode" section of the report tells you exactly how
+many txs fit in each 500 ms window, the budget utilisation, and the
+effective max TPS. That's the number to size validator capacity
+against.
+
+### Custom contracts
+
+Drop your `.wasm` next to (or anywhere reachable from) the binary, then
+either point `--contract path.wasm --call myFn` (simple mode) or write
+a `tx_mix` entry per contract (mix mode). The benchmark deploys it
+once at startup, funds the calling accounts, and runs your function
+with the configured arguments. Argument templates support:
+
+- decimal literals: `"5"` → big-endian bigint
+- hex literals: `"0xfeed"` → raw bytes
+- random tokens: `"rand:8"` → 8 fresh random bytes per call
 
 ### Cold-cache costs
 

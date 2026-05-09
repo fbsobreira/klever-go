@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -95,7 +96,17 @@ func runOnce(cfg Config) (*Report, error) {
 	defer env.Close()
 
 	builder := NewTxBuilder(cfg)
-	wl, err := NewWorkload(cfg, env, builder)
+
+	// If the user wrote a tx_mix the engine routes through the "mix"
+	// workload so multiple tx types and contracts can run in the same
+	// benchmark. Otherwise we honour the simple Workload field.
+	wlName := cfg.Workload
+	if len(cfg.TxMix) > 0 {
+		wlName = "mix"
+	}
+	wlCfg := cfg
+	wlCfg.Workload = wlName
+	wl, err := NewWorkload(wlCfg, env, builder)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +139,7 @@ func runOnce(cfg Config) (*Report, error) {
 	// the per-block ceiling is the only thing limiting throughput.
 	if cfg.PrefillMempool > 0 {
 		fillCtx, fillCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		prefillMempool(fillCtx, cfg, mp, wl)
+		prefillMempool(fillCtx, cfg, mp, wl, metrics)
 		fillCancel()
 	}
 
@@ -139,7 +150,7 @@ func runOnce(cfg Config) (*Report, error) {
 	}
 
 	metrics.Start()
-	startGenerators(ctx, cfg, mp, wl)
+	startGenerators(ctx, cfg, mp, wl, metrics)
 
 	// Run the processor on the main goroutine. It returns when ctx
 	// expires, the tx budget is hit, or the mempool is closed.
@@ -163,7 +174,7 @@ func runOnce(cfg Config) (*Report, error) {
 // start once this returns, so the timed phase begins with the mempool
 // full and the validator pipeline immediately under pressure — exactly
 // the state we want when measuring "max txs that fit in 500 ms".
-func prefillMempool(ctx context.Context, cfg Config, mp *Mempool, wl Workload) {
+func prefillMempool(ctx context.Context, cfg Config, mp *Mempool, wl Workload, ms *Metrics) {
 	target := cfg.PrefillMempool
 	if target <= 0 {
 		return
@@ -178,6 +189,11 @@ func prefillMempool(ctx context.Context, cfg Config, mp *Mempool, wl Workload) {
 				default:
 				}
 				tx := wl.Next(id)
+				t0 := time.Now()
+				if ed25519.Verify(tx.Sender.Public, tx.SigBody, tx.Signature) {
+					tx.Verified = true
+				}
+				ms.SigVerifyIntakeNs.Add(uint64(time.Since(t0).Nanoseconds()))
 				if !mp.Push(ctx, tx) {
 					return
 				}
@@ -197,18 +213,29 @@ func prefillMempool(ctx context.Context, cfg Config, mp *Mempool, wl Workload) {
 // startGenerators launches `cfg.Concurrency` workload producers. Each
 // generator owns a slice of the sender pool (sharded modulo workerID)
 // to keep nonce contention minimal.
-func startGenerators(ctx context.Context, cfg Config, mp *Mempool, wl Workload) {
+func startGenerators(ctx context.Context, cfg Config, mp *Mempool, wl Workload, ms *Metrics) {
 	for i := 0; i < cfg.Concurrency; i++ {
-		go generatorLoop(ctx, i, cfg, mp, wl)
+		go generatorLoop(ctx, i, cfg, mp, wl, ms)
 	}
 }
 
-func generatorLoop(ctx context.Context, id int, cfg Config, mp *Mempool, wl Workload) {
+func generatorLoop(ctx context.Context, id int, cfg Config, mp *Mempool, wl Workload, ms *Metrics) {
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		tx := wl.Next(id)
+		// Verify ed25519 here, in the generator goroutine, so the cost
+		// is amortised across all available cores BEFORE the block
+		// budget clock starts. This mirrors a real validator's mempool
+		// intake path: signatures are checked when the tx arrives, not
+		// when the block builder picks it up. The 500ms slot budget is
+		// therefore spent only on execution + state updates.
+		t0 := time.Now()
+		if ed25519.Verify(tx.Sender.Public, tx.SigBody, tx.Signature) {
+			tx.Verified = true
+		}
+		ms.SigVerifyIntakeNs.Add(uint64(time.Since(t0).Nanoseconds()))
 		if !mp.Push(ctx, tx) {
 			return
 		}

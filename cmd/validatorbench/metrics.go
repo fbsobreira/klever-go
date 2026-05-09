@@ -31,9 +31,10 @@ type Metrics struct {
 	GasUsed       atomic.Uint64
 
 	// Phase-level (nanoseconds)
-	SigVerifyNs atomic.Uint64
-	ExecNs      atomic.Uint64
-	FinalizeNs  atomic.Uint64
+	SigVerifyNs       atomic.Uint64 // legacy: sig hashing inside the block (deprecated)
+	SigVerifyIntakeNs atomic.Uint64 // ed25519 verify done at mempool intake (off-budget)
+	ExecNs            atomic.Uint64
+	FinalizeNs        atomic.Uint64
 
 	// Block-level
 	BlocksProcessed atomic.Uint64

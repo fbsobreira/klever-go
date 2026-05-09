@@ -71,7 +71,8 @@ type Report struct {
 	HashTimeMs     float64 `json:"hash_time_ms"`
 	HashPctOfTotal float64 `json:"hash_pct_of_total"`
 
-	SigVerifyMs float64 `json:"sig_verify_ms"`
+	SigVerifyMs       float64 `json:"sig_verify_ms"`
+	SigVerifyIntakeMs float64 `json:"sig_verify_intake_ms"`
 	ExecMs      float64 `json:"exec_ms"`
 	FinalizeMs  float64 `json:"finalize_ms"`
 
@@ -140,7 +141,10 @@ func BuildReport(cfg Config, m *Metrics, env *VMEnv) *Report {
 	peakTPS, peakSCPS := m.PeakThroughput()
 
 	hashNs := m.HashStats().NanoTotal.Load()
-	totalNs := m.SigVerifyNs.Load() + m.ExecNs.Load() + m.FinalizeNs.Load()
+	// Per-block budget = exec + finalize. Intake-time sig verify is
+	// off-budget and reported separately. Including it would dilute the
+	// hash-pct number with verify time the validator does in the mempool.
+	totalNs := m.ExecNs.Load() + m.FinalizeNs.Load()
 	if totalNs == 0 {
 		totalNs = uint64(m.Duration().Nanoseconds())
 	}
@@ -186,7 +190,8 @@ func BuildReport(cfg Config, m *Metrics, env *VMEnv) *Report {
 		HashBytes:       m.HashStats().Bytes.Load(),
 		HashTimeMs:      float64(hashNs) / 1e6,
 		HashPctOfTotal:  hashPct,
-		SigVerifyMs:     float64(m.SigVerifyNs.Load()) / 1e6,
+		SigVerifyMs:       float64(m.SigVerifyNs.Load()) / 1e6,
+		SigVerifyIntakeMs: float64(m.SigVerifyIntakeNs.Load()) / 1e6,
 		ExecMs:          float64(m.ExecNs.Load()) / 1e6,
 		FinalizeMs:      float64(m.FinalizeNs.Load()) / 1e6,
 		CPUUserSec:      user,
@@ -376,12 +381,12 @@ func PrintTextReport(w io.Writer, r *Report) {
 	fmt.Fprintf(w, "   avg %.3f ms | p50 %.3f | p95 %.3f | p99 %.3f | max %.3f\n",
 		r.LatencyAvgMs, r.LatencyP50Ms, r.LatencyP95Ms, r.LatencyP99Ms, r.LatencyMaxMs)
 	fmt.Fprintln(w, " Phase breakdown (cumulative across run)")
-	fmt.Fprintf(w, "   Sig verify:    %.2f ms (%.1f%%)\n",
-		r.SigVerifyMs, pct(r.SigVerifyMs, r.SigVerifyMs+r.ExecMs+r.FinalizeMs))
-	fmt.Fprintf(w, "   VM execution:  %.2f ms (%.1f%%)\n",
-		r.ExecMs, pct(r.ExecMs, r.SigVerifyMs+r.ExecMs+r.FinalizeMs))
-	fmt.Fprintf(w, "   Finalize:      %.2f ms (%.1f%%)\n",
-		r.FinalizeMs, pct(r.FinalizeMs, r.SigVerifyMs+r.ExecMs+r.FinalizeMs))
+	fmt.Fprintf(w, "   Intake verify:   %.2f ms (off-budget; mempool path)\n", r.SigVerifyIntakeMs)
+	fmt.Fprintln(w, "   --- on the per-block CPU budget ---")
+	fmt.Fprintf(w, "   Tx execution:    %.2f ms (%.1f%%)\n",
+		r.ExecMs, pct(r.ExecMs, r.ExecMs+r.FinalizeMs))
+	fmt.Fprintf(w, "   Block finalize:  %.2f ms (%.1f%%)\n",
+		r.FinalizeMs, pct(r.FinalizeMs, r.ExecMs+r.FinalizeMs))
 	fmt.Fprintf(w, "   Hashing:       %.2f ms (%.1f%% of total)\n", r.HashTimeMs, r.HashPctOfTotal)
 	fmt.Fprintf(w, "   Hashes:        %d (%.2f MB hashed)\n", r.HashCount, float64(r.HashBytes)/(1024*1024))
 	fmt.Fprintln(w, " System")

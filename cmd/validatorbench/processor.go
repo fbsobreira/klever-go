@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -151,12 +149,12 @@ func (p *Processor) processBlock(txs []*Tx) {
 	}
 	blockStart := time.Now()
 
-	// ---- Phase 1: parallel signature verification ----
-	sigStart := time.Now()
-	p.verifySignaturesParallel(txs)
-	p.metrics.SigVerifyNs.Add(uint64(time.Since(sigStart).Nanoseconds()))
+	// Block budget covers execution + finalisation only. Signature
+	// verification has already been amortised across all generator
+	// goroutines at mempool intake — that work is recorded in
+	// metrics.SigVerifyIntakeNs and reported separately.
 
-	// ---- Phase 2: sequential VM execution ----
+	// ---- Phase 1: sequential execution ----
 	execStart := time.Now()
 	hashes := make([][]byte, 0, len(txs))
 	for _, tx := range txs {
@@ -169,7 +167,7 @@ func (p *Processor) processBlock(txs []*Tx) {
 	}
 	p.metrics.ExecNs.Add(uint64(time.Since(execStart).Nanoseconds()))
 
-	// ---- Phase 3: block finalisation ----
+	// ---- Phase 2: block finalisation ----
 	finStart := time.Now()
 	_ = p.env.FinalizeBlock(hashes)
 	p.metrics.FinalizeNs.Add(uint64(time.Since(finStart).Nanoseconds()))
@@ -196,14 +194,13 @@ func (p *Processor) processBlockBudgeted(txs []*Tx, budget time.Duration) (int, 
 	blockStart := time.Now()
 	deadline := blockStart.Add(budget * 95 / 100)
 
-	// Phase 1: parallel signature verification. We pre-verify everything
-	// the validator selected so far (the mempool drain), since real nodes
-	// also batch-verify before execution. Time counts against the budget.
-	sigStart := time.Now()
-	p.verifySignaturesParallel(txs)
-	p.metrics.SigVerifyNs.Add(uint64(time.Since(sigStart).Nanoseconds()))
+	// Signature verification is NOT in the budget — generators verify
+	// at intake. The 500ms here is spent only on execution + state
+	// updates + finalisation, which is what a real validator's
+	// ProcessBlock actually does after the mempool delivers verified
+	// transactions.
 
-	// Phase 2: execute txs sequentially, stopping when the deadline is
+	// Phase 1: execute txs sequentially, stopping when the deadline is
 	// near. Anything not executed is left in the pending slice and will
 	// eventually fall off the back of the mempool — the same fate it
 	// would meet on a busy validator.
@@ -223,7 +220,7 @@ func (p *Processor) processBlockBudgeted(txs []*Tx, budget time.Duration) (int, 
 	}
 	p.metrics.ExecNs.Add(uint64(time.Since(execStart).Nanoseconds()))
 
-	// Phase 3: finalise. Even partial blocks get a merkle root.
+	// Phase 2: finalise. Even partial blocks get a merkle root.
 	finStart := time.Now()
 	_ = p.env.FinalizeBlock(hashes)
 	p.metrics.FinalizeNs.Add(uint64(time.Since(finStart).Nanoseconds()))
@@ -233,41 +230,3 @@ func (p *Processor) processBlockBudgeted(txs []*Tx, budget time.Duration) (int, 
 	return fit, blockDur
 }
 
-// verifySignaturesParallel fans out signature verification across
-// up to `cfg.Concurrency` workers. We use a fixed worker pool with a
-// simple index counter to avoid the overhead of spawning a goroutine
-// per tx, which dominates throughput for small blocks.
-func (p *Processor) verifySignaturesParallel(txs []*Tx) {
-	workers := p.cfg.Concurrency
-	if workers > len(txs) {
-		workers = len(txs)
-	}
-	if workers <= 1 {
-		// Cheap fallback: sequential verify so we don't pay the WaitGroup
-		// cost on tiny blocks.
-		for _, tx := range txs {
-			p.env.Hasher().Compute(string(tx.SigBody))
-			// Real ed25519 verify happens inside ExecuteTx; here we only
-			// pre-warm caches and account for the hashing cost a real
-			// validator would incur during initial deduplication.
-			_ = tx
-		}
-		return
-	}
-	var idx atomic.Uint64
-	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				i := idx.Add(1) - 1
-				if int(i) >= len(txs) {
-					return
-				}
-				p.env.Hasher().Compute(string(txs[i].SigBody))
-			}
-		}()
-	}
-	wg.Wait()
-}

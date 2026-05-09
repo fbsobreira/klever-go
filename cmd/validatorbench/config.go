@@ -9,18 +9,47 @@ import (
 	"time"
 )
 
+// TxMixEntry describes one transaction type in a configurable workload
+// mix. Several entries can coexist; the generator picks among them in
+// proportion to their Weight values, so a real-world mix like
+// "80% transfers, 15% sc-call, 5% sc-deploy" is just three entries.
+//
+// Per-type fields are ignored when the type doesn't use them (e.g.
+// ContractPath is meaningless for "transfer").
+type TxMixEntry struct {
+	Type        string   `json:"type"`            // transfer | sc-call
+	Weight      int      `json:"weight"`          // relative probability
+	ContractPath string  `json:"contract_path"`   // sc-call only
+	InitArgs    []string `json:"init_args"`       // sc-call: deploy args
+	Function    string   `json:"function"`        // sc-call only
+	CallArgs    []string `json:"call_args"`       // sc-call only
+	Instances   int      `json:"instances"`       // sc-call: distinct deployed copies (default 1)
+	Value       int64    `json:"value"`           // transfer: amount per tx (default 1)
+	Complexity  int      `json:"complexity"`      // sc-call: argument repetition multiplier
+}
+
 // Config drives every aspect of the validator throughput benchmark.
 //
 // All durations are stored as strings in the JSON form ("3s", "1m") so the
 // example config file is human-friendly, but parsed into time.Duration once
 // loaded.
 type Config struct {
-	// Workload selection
-	Workload string `json:"workload"`
+	// Workload selection. Two ways to express it:
+	//
+	//  1) Simple: set Workload + ContractPath + CallFunction + …
+	//     (Original interface; still works for one-shot SC tests.)
+	//
+	//  2) Mix: populate TxMix with one or more TxMixEntry items. Each
+	//     entry describes a tx type, contract, and weight. The generator
+	//     picks among them weighted-randomly for every tx, so "80%
+	//     transfer, 15% adder, 5% counter" is just three entries.
+	//
+	// When TxMix is non-empty it takes precedence; the simple fields are
+	// then only used as defaults for any unset per-entry attributes.
+	Workload string       `json:"workload"`
+	TxMix    []TxMixEntry `json:"tx_mix"`
 
-	// Contract path and configuration. The contract is loaded once at start,
-	// deployed by a funded "owner" account, and then the workload drives calls
-	// against it just like a real validator would receive them via P2P.
+	// Simple-mode contract config. Used when TxMix is empty.
 	ContractPath string   `json:"contract_path"`
 	InitArgs     []string `json:"init_args"`
 	CallFunction string   `json:"call_function"`
@@ -125,10 +154,14 @@ func DefaultConfig() Config {
 		ProgressSec:        2,
 		WarmupTransactions: 100,
 		CompareSHA:         false,
-		BlockTime:          0,
-		BlockTimeStr:       "",
-		BlockBudget:        0,
-		BlockBudgetStr:     "",
+		// Klever mainnet slot interval is 4s for all transactions; the
+		// validator has 500ms of CPU budget per block to ship to consensus.
+		// These are the realistic defaults — operators wanting raw burst
+		// numbers can disable budget mode by setting both to "0".
+		BlockTime:          4 * time.Second,
+		BlockTimeStr:       "4s",
+		BlockBudget:        500 * time.Millisecond,
+		BlockBudgetStr:     "500ms",
 		PrefillMempool:     0,
 	}
 }

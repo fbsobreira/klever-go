@@ -57,6 +57,157 @@ func init() {
 	RegisterWorkload("sc-call", newSCCallWorkload)
 	RegisterWorkload("transfer", newTransferWorkload)
 	RegisterWorkload("mixed", newMixedWorkload)
+	RegisterWorkload("mix", newMixWorkloadFromConfig)
+}
+
+// mixEntry is the runtime form of a TxMixEntry: it knows how to build
+// a single tx for its kind, and carries the cumulative weight used by
+// the workload to pick among entries.
+type mixEntry struct {
+	kind     TxKind
+	value    int64
+	contracts []*DeployedContract // sc-call: deployed instances
+	cumWeight int                 // running total used for weighted pick
+}
+
+// mixWorkload draws transactions from a configurable tx_mix. Each
+// entry in the mix can be a transfer or a sc-call against any
+// contract; the engine deploys the contracts at startup so the test
+// can run any combination without re-compiling the benchmark.
+type mixWorkload struct {
+	cfg     Config
+	env     *VMEnv
+	builder *TxBuilder
+	entries []*mixEntry
+	total   int
+	round   atomic.Uint64
+}
+
+// newMixWorkloadFromConfig builds the mix workload from cfg.TxMix. If
+// cfg.TxMix is empty it synthesises a single-entry mix from the
+// simple-mode fields (Workload + ContractPath + …) so old configs
+// continue to work unchanged.
+func newMixWorkloadFromConfig(cfg Config, env *VMEnv, builder *TxBuilder) (Workload, error) {
+	mix := cfg.TxMix
+	if len(mix) == 0 {
+		// Fall back to whichever simple-mode workload was configured.
+		// This path is never hit when the user actually wrote a tx_mix.
+		switch cfg.Workload {
+		case "transfer":
+			mix = []TxMixEntry{{Type: "transfer", Weight: 1, Value: 1}}
+		case "sc-call":
+			mix = []TxMixEntry{{
+				Type:         "sc-call",
+				Weight:       1,
+				ContractPath: cfg.ContractPath,
+				InitArgs:     cfg.InitArgs,
+				Function:     cfg.CallFunction,
+				CallArgs:     cfg.CallArgsTpl,
+				Instances:    cfg.NumContracts,
+				Complexity:   cfg.Complexity,
+			}}
+		default:
+			return nil, fmt.Errorf("mix workload: empty tx_mix and unsupported simple workload %q", cfg.Workload)
+		}
+	}
+
+	w := &mixWorkload{cfg: cfg, env: env, builder: builder}
+	cum := 0
+	for i, e := range mix {
+		if e.Weight <= 0 {
+			return nil, fmt.Errorf("tx_mix[%d]: weight must be > 0", i)
+		}
+		me := &mixEntry{}
+		switch e.Type {
+		case "transfer":
+			me.kind = TxKindTransfer
+			me.value = e.Value
+			if me.value <= 0 {
+				me.value = 1
+			}
+		case "sc-call":
+			if e.ContractPath == "" {
+				return nil, fmt.Errorf("tx_mix[%d]: sc-call needs contract_path", i)
+			}
+			if e.Function == "" {
+				return nil, fmt.Errorf("tx_mix[%d]: sc-call needs function", i)
+			}
+			tpls, err := parseArgTemplates(e.CallArgs)
+			if err != nil {
+				return nil, fmt.Errorf("tx_mix[%d]: %w", i, err)
+			}
+			complexity := e.Complexity
+			if complexity < 1 {
+				complexity = 1
+			}
+			expanded := make([]argTemplate, 0, len(tpls)*complexity)
+			for c := 0; c < complexity; c++ {
+				expanded = append(expanded, tpls...)
+			}
+			instances := e.Instances
+			if instances < 1 {
+				instances = 1
+			}
+			contracts, err := env.DeployContract(e.ContractPath, e.InitArgs, e.Function, expanded, instances)
+			if err != nil {
+				return nil, fmt.Errorf("tx_mix[%d]: %w", i, err)
+			}
+			me.kind = TxKindSCCall
+			me.contracts = contracts
+		default:
+			return nil, fmt.Errorf("tx_mix[%d]: unknown type %q (transfer|sc-call)", i, e.Type)
+		}
+		cum += e.Weight
+		me.cumWeight = cum
+		w.entries = append(w.entries, me)
+	}
+	w.total = cum
+	return w, nil
+}
+
+func (w *mixWorkload) Name() string {
+	parts := make([]string, 0, len(w.entries))
+	for _, e := range w.entries {
+		switch e.kind {
+		case TxKindTransfer:
+			parts = append(parts, fmt.Sprintf("transfer×%d", e.cumWeight))
+		case TxKindSCCall:
+			parts = append(parts, fmt.Sprintf("sc-call(%d instances)×%d", len(e.contracts), e.cumWeight))
+		}
+	}
+	return "mix[" + strings.Join(parts, ", ") + "]"
+}
+
+func (w *mixWorkload) Next(workerID int) *Tx {
+	round := w.round.Add(1) - 1
+	// Cheap weighted pick: round modulo total weight, then linear scan.
+	// Two-digit-entry mixes are by far the common case — no need for a
+	// fancier alias method.
+	target := int(round % uint64(w.total))
+	var picked *mixEntry
+	for _, e := range w.entries {
+		if target < e.cumWeight {
+			picked = e
+			break
+		}
+	}
+	senders := w.env.Senders()
+	switch picked.kind {
+	case TxKindTransfer:
+		sIdx := (workerID + int(round)) % len(senders)
+		rIdx := (sIdx + 1) % len(senders)
+		return w.builder.BuildTransfer(senders[sIdx], senders[rIdx].Address[:], picked.value)
+	case TxKindSCCall:
+		sender := senders[(workerID+int(round))%len(senders)]
+		c := picked.contracts[round%uint64(len(picked.contracts))]
+		args := make([][]byte, 0, len(c.ArgTpls))
+		for _, t := range c.ArgTpls {
+			args = append(args, t.materialize())
+		}
+		return w.builder.Build(sender, c.Address, c.Function, args)
+	}
+	// Fallback should never happen — total > 0 guarantees a pick.
+	return w.builder.BuildTransfer(senders[0], senders[1].Address[:], 1)
 }
 
 // scCallWorkload drives a function-by-name call across `NumContracts`
