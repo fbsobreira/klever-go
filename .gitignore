@@ -56,3 +56,6 @@ test-output.json
 # CI report
 report.xml
 report.json
+
+# validator throughput benchmark output (--output-dir defaults under cwd)
+bench-results/
