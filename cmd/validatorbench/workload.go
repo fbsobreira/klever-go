@@ -113,9 +113,12 @@ func (w *scCallWorkload) Next(workerID int) *Tx {
 	return w.builder.Build(sender, contract, w.function, args)
 }
 
-// transferWorkload simulates the cheapest possible tx — a no-op call that
-// only exercises signature verification, hashing, and nonce updates. It's
-// the "best case" baseline operators care about for raw TPS ceilings.
+// transferWorkload simulates pure value transfers between regular
+// accounts. It NEVER touches the VM — the executor decodes the tx, runs
+// signature verification, then directly updates two account balances
+// and the sender's nonce. This is the realistic baseline for
+// transfer-only TPS, which klever-go validators do on the
+// non-SmartContract code path.
 type transferWorkload struct {
 	cfg     Config
 	env     *VMEnv
@@ -124,24 +127,26 @@ type transferWorkload struct {
 }
 
 func newTransferWorkload(cfg Config, env *VMEnv, builder *TxBuilder) (Workload, error) {
+	if len(env.Senders()) < 2 {
+		return nil, fmt.Errorf("transfer workload needs >= 2 accounts")
+	}
 	return &transferWorkload{cfg: cfg, env: env, builder: builder}, nil
 }
 
 func (w *transferWorkload) Name() string {
-	return fmt.Sprintf("transfer (accounts=%d)", w.cfg.NumAccounts)
+	return fmt.Sprintf("transfer (accounts=%d, no VM)", w.cfg.NumAccounts)
 }
 
 func (w *transferWorkload) Next(workerID int) *Tx {
 	round := w.round.Add(1) - 1
 	senders := w.env.Senders()
-	contracts := w.env.Contracts()
-	sender := senders[(workerID+int(round))%len(senders)]
-	contract := contracts[round%uint64(len(contracts))]
-	// Use the deployed contract as recipient so the VM still does the
-	// account-existence check; the function "" would require deploy-only
-	// recipients, so we point at "noop_*" which the contract rejects —
-	// that maps to the validator's failed-call path.
-	return w.builder.Build(sender, contract, "transfer_noop", nil)
+	// Pick distinct sender / recipient indices; modulo arithmetic guarantees
+	// no self-transfer when NumAccounts >= 2.
+	sIdx := (workerID + int(round)) % len(senders)
+	rIdx := (sIdx + 1) % len(senders)
+	sender := senders[sIdx]
+	recipient := senders[rIdx]
+	return w.builder.BuildTransfer(sender, recipient.Address[:], 1)
 }
 
 // mixedWorkload alternates between transfers and sc-calls in a 1:1 ratio,

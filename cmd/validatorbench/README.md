@@ -14,12 +14,33 @@ specific phase that limits it.
 |---------------------------------------|---------------------------------------------------|
 | Transactions per second               | `tx_total / wall_time`                            |
 | Smart-contract calls per second       | successful VM calls / wall_time                   |
+| Pure transfers per second             | balance-only path, no VM dispatch                 |
+| **Effective max TPS (budget mode)**   | `avg_tx_per_block / block_time`                   |
+| Tx per block under budget             | how many fit in `block_budget` ms                 |
 | Block processing time (avg/peak)      | per-block timer in `Processor.processBlock`        |
 | Hashing time as % of total            | wrapped `Hasher.Compute()` timer                  |
 | CPU usage (user + sys)                | `getrusage(RUSAGE_SELF)`                          |
 | Memory usage                          | `runtime.ReadMemStats()`                          |
 | Latency per transaction               | wall-clock around `RunSmartContractCall`          |
+| Cold-cache deploy + first-call        | per-contract first-touch timer in `VMEnv`         |
 | Failure / timeout rate                | VM `ReturnCode != Ok` divided by total            |
+
+## Two modes
+
+| Mode                      | Triggered by                              | Reports                                                |
+|---------------------------|-------------------------------------------|--------------------------------------------------------|
+| **Raw burst (default)**   | no `--block-time`/`--block-budget`        | host CPU ceiling (TPS as fast as possible)              |
+| **Block-budget**          | `--block-time 3s --block-budget 500ms`    | chain-realistic max TPS — txs per slot ÷ slot interval  |
+
+In budget mode the processor mimics what a klever-go validator does: it
+produces one block every `--block-time` and has at most `--block-budget`
+of CPU time to select, verify, execute, and finalise it. Whatever doesn't
+fit is left in the mempool. The headline number is **EFFECTIVE MAX TPS**
+— what consensus actually sees on a saturated chain.
+
+To make the test honest you want the mempool overloaded, not starved:
+pre-generate enough txs with `--prefill 5000` (or whatever value beats
+your block size).
 
 ## How "real" it really is
 
@@ -80,6 +101,37 @@ LD_LIBRARY_PATH=$(pwd)/kvm/wasmer2 \
 CLI flags override values from the JSON file, so `--duration 60s` on top of
 the example config wins.
 
+### Budget mode (the chain-realistic number)
+
+Run with klever-go's actual slot timing (3 s blocks, 500 ms budget) and
+a prefilled mempool so the validator pipeline is permanently overloaded:
+
+```bash
+# SC-call budget run
+./bin/validatorbench \
+  --workload sc-call --warmup 0 \
+  --block-time 3s --block-budget 500ms \
+  --prefill 5000 --block-size 5000 \
+  --duration 30s
+
+# Pure-transfer budget run (no VM)
+./bin/validatorbench \
+  --workload transfer --warmup 0 \
+  --block-time 4s --block-budget 500ms \
+  --prefill 30000 --block-size 30000 \
+  --duration 30s
+```
+
+The "Block-budget mode" section of the report tells you exactly how many
+txs fit in each 500 ms window, the budget utilisation, and the effective
+max TPS. That's the number to size validator capacity against.
+
+### Cold-cache costs
+
+Run a tiny `--tx 5 --warmup 0` to surface the deploy and first-call
+latencies. They're paid once per contract per process restart and they
+dominate the worst-case block.
+
 ### Compare SHA hardware acceleration
 
 `--compare-sha` runs the benchmark twice — once with the default Go hash
@@ -130,6 +182,9 @@ disables the SHA-NI fast path before `crypto/sha256` is initialised.
 --json                  force-enable JSON report
 --csv                   force-enable CSV report
 --compare-sha           run twice (HW SHA on/off) and emit a comparative summary
+--block-time duration   chain slot interval (e.g. 3s); enables budget mode together with --block-budget
+--block-budget duration max processing time per block (e.g. 500ms); the headline EFFECTIVE MAX TPS comes from this
+--prefill int           transactions to pre-generate into the mempool before timing starts (recommended in budget mode)
 --version               print version and exit
 ```
 
@@ -161,6 +216,9 @@ See `config.example.json` for an annotated example. Fields:
 | `progress_interval_seconds` | int         | stderr ticker (0 disables)                           |
 | `warmup_transactions`       | int         | un-timed pre-roll                                   |
 | `compare_sha`               | bool        | runs HW-on then HW-off back-to-back                  |
+| `block_time`                | string      | chain slot interval (`3s`, `4s`); enables budget mode |
+| `block_budget`              | string      | max CPU time per block (`500ms`); requires block_time |
+| `prefill_mempool`           | int         | txs to pre-generate before timing starts (overload)   |
 
 ## Output
 

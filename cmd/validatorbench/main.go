@@ -107,9 +107,14 @@ func runOnce(cfg Config) (*Report, error) {
 		hashStats.Reset()
 	}
 
-	// Mempool capacity sized to keep the generator a step ahead of the
-	// processor without using unbounded memory on long runs.
-	mp := NewMempool(cfg.BlockSize * 8)
+	// Mempool capacity: in budget mode we want it permanently overloaded
+	// so the processor never waits for txs and we measure its true
+	// ceiling. The capacity is the larger of (prefill, block_size * 8).
+	mempoolCap := cfg.BlockSize * 8
+	if cfg.PrefillMempool > mempoolCap {
+		mempoolCap = cfg.PrefillMempool
+	}
+	mp := NewMempool(mempoolCap)
 	metrics := NewMetrics(min(cfg.NumTransactions, 200_000), hashStats)
 	proc := NewProcessor(cfg, env, mp, metrics)
 
@@ -117,6 +122,15 @@ func runOnce(cfg Config) (*Report, error) {
 	defer cancel()
 
 	stopOnSignal(cancel)
+
+	// Prefill the mempool synchronously before timing starts. This is the
+	// cleanest way to simulate the "validator is overloaded" state where
+	// the per-block ceiling is the only thing limiting throughput.
+	if cfg.PrefillMempool > 0 {
+		fillCtx, fillCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		prefillMempool(fillCtx, cfg, mp, wl)
+		fillCancel()
+	}
 
 	if !cfg.Verbose {
 		// Even non-verbose runs deserve a heartbeat so it's clear the
@@ -141,7 +155,43 @@ func runOnce(cfg Config) (*Report, error) {
 	mp.Close()
 	metrics.Stop()
 
-	return BuildReport(cfg, metrics), nil
+	return BuildReport(cfg, metrics, env), nil
+}
+
+// prefillMempool synchronously generates Cfg.PrefillMempool transactions
+// using the configured workload + concurrency. The processor will only
+// start once this returns, so the timed phase begins with the mempool
+// full and the validator pipeline immediately under pressure — exactly
+// the state we want when measuring "max txs that fit in 500 ms".
+func prefillMempool(ctx context.Context, cfg Config, mp *Mempool, wl Workload) {
+	target := cfg.PrefillMempool
+	if target <= 0 {
+		return
+	}
+	produced := make(chan struct{}, target)
+	for i := 0; i < cfg.Concurrency; i++ {
+		go func(id int) {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				tx := wl.Next(id)
+				if !mp.Push(ctx, tx) {
+					return
+				}
+				produced <- struct{}{}
+			}
+		}(i)
+	}
+	for i := 0; i < target; i++ {
+		select {
+		case <-produced:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // startGenerators launches `cfg.Concurrency` workload producers. Each

@@ -21,12 +21,14 @@ type Metrics struct {
 	StoppedAt time.Time
 
 	// Tx-level
-	TxTotal     atomic.Uint64
-	TxFailed    atomic.Uint64
-	TxTimeout   atomic.Uint64
-	SCCallsOK   atomic.Uint64
-	SCCallsFail atomic.Uint64
-	GasUsed     atomic.Uint64
+	TxTotal       atomic.Uint64
+	TxFailed      atomic.Uint64
+	TxTimeout     atomic.Uint64
+	SCCallsOK     atomic.Uint64
+	SCCallsFail   atomic.Uint64
+	TransfersOK   atomic.Uint64
+	TransfersFail atomic.Uint64
+	GasUsed       atomic.Uint64
 
 	// Phase-level (nanoseconds)
 	SigVerifyNs atomic.Uint64
@@ -59,6 +61,12 @@ type Metrics struct {
 	cpuStartSysNs  uint64
 	cpuEndUserNs   uint64
 	cpuEndSysNs    uint64
+
+	// Budget-mode bookkeeping. Each entry is one slot.
+	budgetMu      sync.Mutex
+	budgetTxFit   []int
+	budgetUsedNs  []uint64
+	emptySlots    atomic.Uint64
 
 	// Memory snapshot at end of run.
 	endHeapBytes uint64
@@ -112,18 +120,28 @@ func (m *Metrics) Stop() {
 	m.endNumGC = ms.NumGC
 }
 
-// RecordTx logs the result of a single transaction.
-//
-// gasProvided is the gas allotted by the caller; gasRemaining comes from the
-// VMOutput. The difference is the actual gas burned, which we sum into
-// GasUsed so the report can derive average gas-per-tx.
-func (m *Metrics) RecordTx(latency time.Duration, failed bool, gasProvided uint64, out *vmcommon.VMOutput) {
+// RecordTxByKind logs the result of a single transaction, splitting
+// successful and failed counts by transaction kind so the report can
+// distinguish "raw transfer rate" from "SC call rate" — the two scale
+// very differently and reporting one global TPS conflates them.
+func (m *Metrics) RecordTxByKind(kind TxKind, latency time.Duration, failed bool, gasProvided uint64, out *vmcommon.VMOutput) {
 	m.TxTotal.Add(1)
 	if failed {
 		m.TxFailed.Add(1)
-		m.SCCallsFail.Add(1)
-	} else {
-		m.SCCallsOK.Add(1)
+	}
+	switch kind {
+	case TxKindSCCall:
+		if failed {
+			m.SCCallsFail.Add(1)
+		} else {
+			m.SCCallsOK.Add(1)
+		}
+	case TxKindTransfer:
+		if failed {
+			m.TransfersFail.Add(1)
+		} else {
+			m.TransfersOK.Add(1)
+		}
 	}
 	if out != nil && gasProvided >= out.GasRemaining {
 		m.GasUsed.Add(gasProvided - out.GasRemaining)
@@ -181,6 +199,36 @@ func (m *Metrics) RecordBlock(d time.Duration, txCount int) {
 	}
 	m.tpsMu.Unlock()
 }
+
+// RecordBudgetSlot logs the result of one budget-mode slot: how many
+// txs fit and how long the block took. The deadline parameter is kept
+// for symmetry with future "missed deadline" alerting.
+func (m *Metrics) RecordBudgetSlot(fit int, used time.Duration, _ time.Duration) {
+	m.budgetMu.Lock()
+	m.budgetTxFit = append(m.budgetTxFit, fit)
+	m.budgetUsedNs = append(m.budgetUsedNs, uint64(used.Nanoseconds()))
+	m.budgetMu.Unlock()
+}
+
+// RecordEmptySlot bumps the counter of slots where the mempool was dry.
+// In a real chain that's an idle validator — useful to surface here so
+// users tune --prefill or --concurrency until the count is zero.
+func (m *Metrics) RecordEmptySlot() { m.emptySlots.Add(1) }
+
+// BudgetSlots returns a copy of the per-slot fit/used vectors so the
+// reporter can compute min/avg/max without holding the lock.
+func (m *Metrics) BudgetSlots() (fit []int, usedNs []uint64) {
+	m.budgetMu.Lock()
+	defer m.budgetMu.Unlock()
+	fit = make([]int, len(m.budgetTxFit))
+	copy(fit, m.budgetTxFit)
+	usedNs = make([]uint64, len(m.budgetUsedNs))
+	copy(usedNs, m.budgetUsedNs)
+	return
+}
+
+// EmptySlots returns the count of mempool-starved slots.
+func (m *Metrics) EmptySlots() uint64 { return m.emptySlots.Load() }
 
 // LatencyPercentiles returns p50/p95/p99/avg/max latencies in time.Duration.
 // It sorts a copy of the reservoir so callers can compute these values

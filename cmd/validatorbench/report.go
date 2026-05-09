@@ -42,17 +42,20 @@ type Report struct {
 	System      SystemInfo  `json:"system"`
 	Hashing     HashAccelInfo `json:"hashing"`
 
-	DurationSec   float64 `json:"duration_seconds"`
-	TxTotal       uint64  `json:"tx_total"`
-	TxFailed      uint64  `json:"tx_failed"`
-	SCCallsOK     uint64  `json:"sc_calls_ok"`
-	SCCallsFailed uint64  `json:"sc_calls_failed"`
-	BlocksTotal   uint64  `json:"blocks_total"`
+	DurationSec    float64 `json:"duration_seconds"`
+	TxTotal        uint64  `json:"tx_total"`
+	TxFailed       uint64  `json:"tx_failed"`
+	SCCallsOK      uint64  `json:"sc_calls_ok"`
+	SCCallsFailed  uint64  `json:"sc_calls_failed"`
+	TransfersOK    uint64  `json:"transfers_ok"`
+	TransfersFail  uint64  `json:"transfers_failed"`
+	BlocksTotal    uint64  `json:"blocks_total"`
 
-	AvgTPS  float64 `json:"avg_tps"`
-	PeakTPS float64 `json:"peak_tps"`
-	AvgSCPS float64 `json:"avg_scps"`
-	PeakSCPS float64 `json:"peak_scps"`
+	AvgTPS         float64 `json:"avg_tps"`
+	PeakTPS        float64 `json:"peak_tps"`
+	AvgSCPS        float64 `json:"avg_scps"`
+	PeakSCPS       float64 `json:"peak_scps"`
+	AvgTransferPS  float64 `json:"avg_transfer_ps"`
 
 	BlockTimeAvgMs  float64 `json:"block_time_avg_ms"`
 	BlockTimePeakMs float64 `json:"block_time_peak_ms"`
@@ -84,10 +87,40 @@ type Report struct {
 	FailureRate     float64 `json:"failure_rate"`
 	TimeoutRate     float64 `json:"timeout_rate"`
 	ValidatorImpact string  `json:"validator_impact"`
+
+	// Cold-cache costs paid once per process restart per contract.
+	// Cold calls are first invocations after deploy, before any caches
+	// are warm. Operators size capacity around these numbers because
+	// they dominate the worst-case block.
+	DeployCount       int     `json:"deploy_count"`
+	DeployAvgMs       float64 `json:"deploy_avg_ms"`
+	DeployMaxMs       float64 `json:"deploy_max_ms"`
+	ColdCallCount     int     `json:"cold_call_count"`
+	ColdCallAvgMs     float64 `json:"cold_call_avg_ms"`
+	ColdCallMaxMs     float64 `json:"cold_call_max_ms"`
+	ColdCallMinMs     float64 `json:"cold_call_min_ms"`
+
+	// Budget-mode results. Populated only when BlockTime + BlockBudget
+	// are configured; otherwise EffectiveMaxTPS == 0.
+	BudgetMode          bool    `json:"budget_mode"`
+	BlockTimeMs         float64 `json:"block_time_ms"`
+	BlockBudgetMs       float64 `json:"block_budget_ms"`
+	SlotsTotal          int     `json:"slots_total"`
+	SlotsEmpty          uint64  `json:"slots_empty"`
+	TxPerBlockMin       int     `json:"tx_per_block_min"`
+	TxPerBlockAvg       float64 `json:"tx_per_block_avg"`
+	TxPerBlockMax       int     `json:"tx_per_block_max"`
+	BlockBudgetUsedAvgPct float64 `json:"block_budget_used_avg_pct"`
+	BlockBudgetUsedMaxPct float64 `json:"block_budget_used_max_pct"`
+	EffectiveMaxTPS     float64 `json:"effective_max_tps"`
 }
 
 // BuildReport rolls metrics + config + system info into the Report.
-func BuildReport(cfg Config, m *Metrics) *Report {
+//
+// env is optional — when non-nil it contributes deploy and cold-call
+// latency stats. We accept nil so the JSON-only child path in compare
+// mode (which does not need to re-derive cold latencies) keeps working.
+func BuildReport(cfg Config, m *Metrics, env *VMEnv) *Report {
 	dur := m.Duration().Seconds()
 	if dur <= 0 {
 		dur = 1e-9 // avoid divide-by-zero in degenerate runs
@@ -96,6 +129,8 @@ func BuildReport(cfg Config, m *Metrics) *Report {
 	tx := m.TxTotal.Load()
 	scOK := m.SCCallsOK.Load()
 	scFail := m.SCCallsFail.Load()
+	trOK := m.TransfersOK.Load()
+	trFail := m.TransfersFail.Load()
 	failed := m.TxFailed.Load()
 	blocks := m.BlocksProcessed.Load()
 
@@ -132,11 +167,14 @@ func BuildReport(cfg Config, m *Metrics) *Report {
 		TxFailed:        failed,
 		SCCallsOK:       scOK,
 		SCCallsFailed:   scFail,
+		TransfersOK:     trOK,
+		TransfersFail:   trFail,
 		BlocksTotal:     blocks,
 		AvgTPS:          avgTPS,
 		PeakTPS:         peakTPS,
 		AvgSCPS:         avgSCPS,
 		PeakSCPS:        peakSCPS,
+		AvgTransferPS:   float64(trOK) / dur,
 		BlockTimeAvgMs:  float64(blockAvgNs) / 1e6,
 		BlockTimePeakMs: float64(m.BlockNsPeak.Load()) / 1e6,
 		LatencyAvgMs:    float64(avg) / 1e6,
@@ -161,9 +199,99 @@ func BuildReport(cfg Config, m *Metrics) *Report {
 	if tx > 0 {
 		r.FailureRate = (float64(failed) / float64(tx)) * 100
 	}
+
+	if env != nil {
+		populateColdCalls(r, env)
+	}
+	if cfg.BudgetMode() {
+		populateBudgetMode(r, cfg, m)
+	}
+
 	r.Bottleneck = identifyBottleneck(r, m)
 	r.ValidatorImpact = classifyImpact(r)
 	return r
+}
+
+// populateColdCalls fills in the deploy and first-call latency stats
+// from the VMEnv's instrumentation.
+func populateColdCalls(r *Report, env *VMEnv) {
+	deploys := env.DeployLatencies()
+	r.DeployCount = len(deploys)
+	if len(deploys) > 0 {
+		var sum, max time.Duration
+		for _, d := range deploys {
+			sum += d
+			if d > max {
+				max = d
+			}
+		}
+		r.DeployAvgMs = float64(sum/time.Duration(len(deploys))) / 1e6
+		r.DeployMaxMs = float64(max) / 1e6
+	}
+	colds := env.FirstCallLatencies()
+	r.ColdCallCount = len(colds)
+	if len(colds) > 0 {
+		var sum, max, min time.Duration
+		min = colds[0]
+		for _, d := range colds {
+			sum += d
+			if d > max {
+				max = d
+			}
+			if d < min {
+				min = d
+			}
+		}
+		r.ColdCallAvgMs = float64(sum/time.Duration(len(colds))) / 1e6
+		r.ColdCallMaxMs = float64(max) / 1e6
+		r.ColdCallMinMs = float64(min) / 1e6
+	}
+}
+
+// populateBudgetMode rolls per-slot stats into the headline numbers.
+// EffectiveMaxTPS is the chain-realistic ceiling: avg txs that fit in
+// each slot divided by the slot interval.
+func populateBudgetMode(r *Report, cfg Config, m *Metrics) {
+	r.BudgetMode = true
+	r.BlockTimeMs = float64(cfg.BlockTime) / 1e6
+	r.BlockBudgetMs = float64(cfg.BlockBudget) / 1e6
+	r.SlotsEmpty = m.EmptySlots()
+
+	fit, usedNs := m.BudgetSlots()
+	r.SlotsTotal = len(fit) + int(r.SlotsEmpty)
+	if len(fit) == 0 {
+		return
+	}
+	sum := 0
+	min, max := fit[0], 0
+	for _, n := range fit {
+		sum += n
+		if n < min {
+			min = n
+		}
+		if n > max {
+			max = n
+		}
+	}
+	avg := float64(sum) / float64(len(fit))
+	r.TxPerBlockMin = min
+	r.TxPerBlockMax = max
+	r.TxPerBlockAvg = avg
+
+	var sumUsed, maxUsed uint64
+	for _, u := range usedNs {
+		sumUsed += u
+		if u > maxUsed {
+			maxUsed = u
+		}
+	}
+	avgUsedNs := float64(sumUsed) / float64(len(usedNs))
+	r.BlockBudgetUsedAvgPct = (avgUsedNs / float64(cfg.BlockBudget.Nanoseconds())) * 100
+	r.BlockBudgetUsedMaxPct = (float64(maxUsed) / float64(cfg.BlockBudget.Nanoseconds())) * 100
+
+	// Effective max TPS: average txs per block ÷ wall-clock block interval.
+	// This is the number the validator actually ships to consensus.
+	r.EffectiveMaxTPS = avg / cfg.BlockTime.Seconds()
 }
 
 // identifyBottleneck inspects the phase-time breakdown and CPU/memory
@@ -238,6 +366,10 @@ func PrintTextReport(w io.Writer, r *Report) {
 	fmt.Fprintf(w, "   Transactions:  %d total, %d failed (%.2f%% fail)\n", r.TxTotal, r.TxFailed, r.FailureRate)
 	fmt.Fprintf(w, "   Avg TPS:       %.1f       Peak TPS:    %.1f\n", r.AvgTPS, r.PeakTPS)
 	fmt.Fprintf(w, "   Avg SC/s:      %.1f       Peak SC/s:   %.1f\n", r.AvgSCPS, r.PeakSCPS)
+	if r.TransfersOK+r.TransfersFail > 0 {
+		fmt.Fprintf(w, "   Avg Transfer/s: %.1f      Transfers OK/Fail: %d/%d\n",
+			r.AvgTransferPS, r.TransfersOK, r.TransfersFail)
+	}
 	fmt.Fprintf(w, "   Blocks:        %d (avg %.2f ms, peak %.2f ms)\n",
 		r.BlocksTotal, r.BlockTimeAvgMs, r.BlockTimePeakMs)
 	fmt.Fprintln(w, " Latency")
@@ -257,6 +389,32 @@ func PrintTextReport(w io.Writer, r *Report) {
 		r.CPUUserSec, r.CPUSysSec, r.CPUPct)
 	fmt.Fprintf(w, "   Heap:          %.2f MB    Sys: %.2f MB    GC cycles: %d\n",
 		float64(r.HeapBytes)/(1024*1024), float64(r.SysBytes)/(1024*1024), r.NumGC)
+	if r.DeployCount > 0 || r.ColdCallCount > 0 {
+		fmt.Fprintln(w, "----------------------------------------------------------")
+		fmt.Fprintln(w, " Cold-cache costs (paid once per process restart per contract)")
+		if r.DeployCount > 0 {
+			fmt.Fprintf(w, "   Deploy:            %d contracts, avg %.2f ms, max %.2f ms\n",
+				r.DeployCount, r.DeployAvgMs, r.DeployMaxMs)
+		}
+		if r.ColdCallCount > 0 {
+			fmt.Fprintf(w, "   First call:        %d contracts, avg %.3f ms, min %.3f ms, max %.3f ms\n",
+				r.ColdCallCount, r.ColdCallAvgMs, r.ColdCallMinMs, r.ColdCallMaxMs)
+		}
+	}
+	if r.BudgetMode {
+		fmt.Fprintln(w, "----------------------------------------------------------")
+		fmt.Fprintln(w, " Block-budget mode (chain-realistic ceiling)")
+		fmt.Fprintf(w, "   Block time:        %.0f ms (slot interval)\n", r.BlockTimeMs)
+		fmt.Fprintf(w, "   Block budget:      %.0f ms (max processing time per block)\n", r.BlockBudgetMs)
+		fmt.Fprintf(w, "   Slots:             %d total, %d empty (mempool starved)\n",
+			r.SlotsTotal, r.SlotsEmpty)
+		fmt.Fprintf(w, "   Tx per block:      avg %.1f, min %d, max %d\n",
+			r.TxPerBlockAvg, r.TxPerBlockMin, r.TxPerBlockMax)
+		fmt.Fprintf(w, "   Budget used:       avg %.1f%%, max %.1f%%\n",
+			r.BlockBudgetUsedAvgPct, r.BlockBudgetUsedMaxPct)
+		fmt.Fprintf(w, "   EFFECTIVE MAX TPS: %.0f tx/s (%.1f tx/block ÷ %.1fs)\n",
+			r.EffectiveMaxTPS, r.TxPerBlockAvg, r.BlockTimeMs/1000)
+	}
 	fmt.Fprintln(w, "----------------------------------------------------------")
 	fmt.Fprintln(w, " Summary")
 	fmt.Fprintf(w, "   Bottleneck:        %s\n", r.Bottleneck)

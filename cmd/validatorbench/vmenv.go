@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/klever-io/klever-go/crypto/hashing"
 	"github.com/klever-io/klever-go/kvm/scenarioexec"
-	scenmodel "github.com/klever-io/klever-go/kvm/scenarioexec/model"
 	worldhook "github.com/klever-io/klever-go/kvm/mock/world"
+	scenmodel "github.com/klever-io/klever-go/kvm/scenarioexec/model"
 	"github.com/klever-io/klever-go/vmcommon"
 )
 
@@ -44,6 +46,12 @@ type VMEnv struct {
 	owner   *Account
 	senders []*Account
 	scAddrs [][]byte // one address per deployed contract instance
+
+	// Per-contract deploy/first-call timing. Keys are stringified addresses.
+	deployLatency  []time.Duration
+	firstCallMu    sync.Mutex
+	firstCallSeen  map[string]bool
+	firstCallTimes []time.Duration
 }
 
 // NewVMEnv prepares a fully-initialised VM with the chosen hasher,
@@ -65,10 +73,11 @@ func NewVMEnv(cfg Config, hashStats *HashStats) (*VMEnv, error) {
 	}
 
 	env := &VMEnv{
-		cfg:    cfg,
-		exec:   exec,
-		hasher: base,
-		timed:  timed,
+		cfg:           cfg,
+		exec:          exec,
+		hasher:        base,
+		timed:         timed,
+		firstCallSeen: make(map[string]bool),
 	}
 
 	// Seed all senders before initializing the VM so the accounts cacher is
@@ -110,6 +119,21 @@ func (e *VMEnv) Senders() []*Account { return e.senders }
 
 // Contracts returns the addresses of all deployed contract instances.
 func (e *VMEnv) Contracts() [][]byte { return e.scAddrs }
+
+// DeployLatencies returns the wall-clock time of every contract deploy
+// (compile + init invoke), in deploy order.
+func (e *VMEnv) DeployLatencies() []time.Duration { return e.deployLatency }
+
+// FirstCallLatencies returns the per-contract first-invocation latency in
+// the order calls happened. Useful to surface the cold-cache cost of
+// hitting a contract for the first time after deploy.
+func (e *VMEnv) FirstCallLatencies() []time.Duration {
+	e.firstCallMu.Lock()
+	defer e.firstCallMu.Unlock()
+	out := make([]time.Duration, len(e.firstCallTimes))
+	copy(out, e.firstCallTimes)
+	return out
+}
 
 // bootstrapAccounts creates a deterministic-but-distinct owner and a
 // pool of sender accounts, all funded with cfg.InitialBalance. We use
@@ -176,13 +200,19 @@ func (e *VMEnv) deployContracts() error {
 			},
 		}
 
+		// Time the deploy: wasmer2 compiles the WASM module here. This is
+		// the dominant first-touch cost for any contract and what the
+		// validator pays once per process restart per contract.
+		deployStart := time.Now()
 		out, err := e.exec.GetVM().RunSmartContractCreate(input)
+		deployDur := time.Since(deployStart)
 		if err != nil {
 			return fmt.Errorf("deploy %d: %w", i, err)
 		}
 		if out.ReturnCode != vmcommon.Ok {
 			return fmt.Errorf("deploy %d failed: %s (%s)", i, out.ReturnCode, out.ReturnMessage)
 		}
+		e.deployLatency = append(e.deployLatency, deployDur)
 
 		// Persist the new SC and mutated owner into the mock world so the
 		// next call sees a committed, real account state.
@@ -217,19 +247,35 @@ func (e *VMEnv) deployContracts() error {
 //  3. invoke the VM
 //  4. commit output to the trie
 //
-// Returns the VM output (so callers can record gas + retcode) and any
-// error that broke the pipeline. A failed VM call (out of gas, revert)
-// is NOT returned as an error — that maps to a "tx failed" stat.
+// Returns the VM output (so callers can record gas + retcode), a "failed"
+// flag (set on signature mismatch, OOG, revert, or commit error), and a
+// hard error (only set on infrastructure-level failures the caller should
+// surface). VM-level failures (OOG, revert) DO NOT return an error —
+// they're counted as tx failures in metrics.
 func (e *VMEnv) ExecuteTx(tx *Tx, hashStats *HashStats) (*vmcommon.VMOutput, bool, error) {
 	// Hash the marshalled transaction body — the validator does this once
 	// per tx for the merkle leaf and for the on-disk tx index.
 	_ = e.timed.Compute(string(tx.Bytes))
 
-	// Verify ed25519 signature. We hash the tx body inside the timer so
-	// the cost shows up in the "hash share" metric where appropriate.
-	digest := e.timed.Compute(string(tx.SigBody))
-	if !ed25519.Verify(tx.Sender.Public, digest, tx.Signature) {
-		return nil, false, nil
+	// Hash the sig pre-image too: the validator computes this hash so it
+	// can index by tx-hash in the receipt store. Counting it here keeps
+	// the "hashing time as % of total" metric accurate.
+	_ = e.timed.Compute(string(tx.SigBody))
+
+	// Verify the ed25519 signature against the raw sig body. Ed25519's
+	// "pure" mode signs the message directly, so Verify must receive the
+	// same bytes Sign saw — not the digest.
+	if !ed25519.Verify(tx.Sender.Public, tx.SigBody, tx.Signature) {
+		// Signature mismatch is a tx failure, not a pipeline error: count
+		// it as failed so the report's failure-rate column reflects it.
+		return nil, true, nil
+	}
+
+	// Pure transfer: skip the VM entirely. The validator does the same
+	// — non-SC txs go through the kapps balance path, not the wasm host.
+	if tx.Kind == TxKindTransfer {
+		failed, err := e.executeTransfer(tx)
+		return nil, failed, err
 	}
 
 	hash := txHash(tx.Sender.Nonce, tx.SeqID)
@@ -247,7 +293,20 @@ func (e *VMEnv) ExecuteTx(tx *Tx, hashStats *HashStats) (*vmcommon.VMOutput, boo
 		},
 	}
 
+	callStart := time.Now()
 	out, err := e.exec.GetVM().RunSmartContractCall(input)
+	callDur := time.Since(callStart)
+	// Track the first call per contract address: this is the latency of
+	// the cold-cache invocation right after deploy and right after a
+	// validator process restart.
+	e.firstCallMu.Lock()
+	key := string(tx.Recipient)
+	if !e.firstCallSeen[key] {
+		e.firstCallSeen[key] = true
+		e.firstCallTimes = append(e.firstCallTimes, callDur)
+	}
+	e.firstCallMu.Unlock()
+
 	if err != nil {
 		return nil, false, err
 	}
@@ -261,6 +320,42 @@ func (e *VMEnv) ExecuteTx(tx *Tx, hashStats *HashStats) (*vmcommon.VMOutput, boo
 		return out, true, fmt.Errorf("commit tx: %w", err)
 	}
 	return out, false, nil
+}
+
+// executeTransfer performs a value move between two regular accounts
+// without involving the VM. This mirrors the klever-go non-SC code path
+// where the kapps controller handles balance bookkeeping directly.
+//
+// The sequence — load sender, debit + nonce++, save; load recipient,
+// credit, save — is what dominates real transfer-block CPU time, and
+// it's what the per-block budget needs to fit when measuring the TPS
+// ceiling for transfer-heavy chains.
+func (e *VMEnv) executeTransfer(tx *Tx) (bool, error) {
+	cacher := e.exec.World.AccountsCacher
+
+	sender, err := cacher.GetExistingUser(tx.Sender.Address[:])
+	if err != nil || sender == nil {
+		return true, nil
+	}
+	if err := sender.SubFromBalance(tx.Value, nil, true); err != nil {
+		return true, nil
+	}
+	sender.IncreaseNonce(1)
+	if err := cacher.SaveUser(sender); err != nil {
+		return true, fmt.Errorf("save sender: %w", err)
+	}
+
+	recipient, err := cacher.LoadUser(tx.Recipient)
+	if err != nil || recipient == nil {
+		return true, nil
+	}
+	if err := recipient.AddToBalance(tx.Value, nil, true); err != nil {
+		return true, nil
+	}
+	if err := cacher.SaveUser(recipient); err != nil {
+		return true, fmt.Errorf("save recipient: %w", err)
+	}
+	return false, nil
 }
 
 // FinalizeBlock computes the merkle-style root over the per-tx hashes and

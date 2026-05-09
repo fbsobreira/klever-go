@@ -43,7 +43,20 @@ func NewMempool(capacity int) *Mempool {
 // Push tries to enqueue a tx. If the mempool is full and ctx is canceled,
 // it returns false with the tx counted as dropped — the same fate the
 // real mempool gives to overflow traffic.
-func (m *Mempool) Push(ctx context.Context, tx *Tx) bool {
+//
+// Safe to call concurrently with Close: a recover guards against the
+// "send on closed channel" race that happens at the very end of a run
+// when the processor has already returned but generators are still in
+// flight.
+func (m *Mempool) Push(ctx context.Context, tx *Tx) (ok bool) {
+	defer func() {
+		// recover from "send on closed channel" — the channel was closed
+		// concurrently with this push, which means we're shutting down.
+		if r := recover(); r != nil {
+			m.dropped.Add(1)
+			ok = false
+		}
+	}()
 	select {
 	case m.in <- tx:
 		m.enqueued.Add(1)

@@ -68,6 +68,27 @@ type Config struct {
 	// produces a comparative summary. Implemented by re-executing the binary
 	// with --internal-mode flags so that GODEBUG can be set before init().
 	CompareSHA bool `json:"compare_sha"`
+
+	// --- Block-budget mode -------------------------------------------------
+	//
+	// A real validator does not "go as fast as possible" — it produces one
+	// block every BlockTime seconds and has at most BlockBudget of CPU time
+	// to select transactions, run them, and ship the block to consensus.
+	//
+	// When BlockTime > 0 AND BlockBudget > 0, the processor switches to
+	// budget mode: per slot it pulls from the (preferably overloaded)
+	// mempool, processes txs sequentially until the per-block deadline is
+	// nearly reached, finalises the block, then sleeps until the next slot.
+	//
+	// The headline metric in this mode is "max txs that fit in BlockBudget"
+	// → effective_max_tps = avg_tx_per_block / BlockTime. That is the
+	// number operators need when sizing capacity for SC-heavy chains where
+	// 12k tx/block measured on transfers does NOT translate to SC traffic.
+	BlockTime       time.Duration `json:"-"`
+	BlockTimeStr    string        `json:"block_time"`
+	BlockBudget     time.Duration `json:"-"`
+	BlockBudgetStr  string        `json:"block_budget"`
+	PrefillMempool  int           `json:"prefill_mempool"`
 }
 
 // DefaultConfig returns a benchmark config tuned for a single-node validator
@@ -104,6 +125,11 @@ func DefaultConfig() Config {
 		ProgressSec:        2,
 		WarmupTransactions: 100,
 		CompareSHA:         false,
+		BlockTime:          0,
+		BlockTimeStr:       "",
+		BlockBudget:        0,
+		BlockBudgetStr:     "",
+		PrefillMempool:     0,
 	}
 }
 
@@ -131,7 +157,27 @@ func LoadConfig(path string) (Config, error) {
 		}
 		cfg.Duration = d
 	}
+	if cfg.BlockTimeStr != "" {
+		d, err := time.ParseDuration(cfg.BlockTimeStr)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid block_time %q: %w", cfg.BlockTimeStr, err)
+		}
+		cfg.BlockTime = d
+	}
+	if cfg.BlockBudgetStr != "" {
+		d, err := time.ParseDuration(cfg.BlockBudgetStr)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid block_budget %q: %w", cfg.BlockBudgetStr, err)
+		}
+		cfg.BlockBudget = d
+	}
 	return cfg, nil
+}
+
+// BudgetMode returns true when the processor should produce blocks on a
+// fixed slot clock with a hard per-block CPU deadline.
+func (c *Config) BudgetMode() bool {
+	return c.BlockTime > 0 && c.BlockBudget > 0
 }
 
 // Validate sanity-checks the configuration after CLI flags have been merged.
@@ -170,6 +216,9 @@ func (c *Config) Validate() error {
 		if err := os.MkdirAll(c.OutputDir, 0o755); err != nil {
 			return fmt.Errorf("create output_dir: %w", err)
 		}
+	}
+	if c.BlockBudget > 0 && c.BlockTime > 0 && c.BlockBudget > c.BlockTime {
+		return fmt.Errorf("block_budget (%s) must be <= block_time (%s)", c.BlockBudget, c.BlockTime)
 	}
 	return nil
 }

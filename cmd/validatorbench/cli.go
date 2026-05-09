@@ -33,6 +33,10 @@ type cliOverrides struct {
 	CSV          bool
 	CompareSHA   bool
 
+	BlockTime    time.Duration
+	BlockBudget  time.Duration
+	Prefill      int
+
 	// Tracking flags that were actually set so we can distinguish
 	// between "user said 0" and "user didn't say".
 	setMask map[string]bool
@@ -71,6 +75,9 @@ func parseFlags() (cliOverrides, string, bool) {
 	fs.BoolVar(&o.JSON, "json", false, "force-enable JSON report")
 	fs.BoolVar(&o.CSV, "csv", false, "force-enable CSV report")
 	fs.BoolVar(&o.CompareSHA, "compare-sha", false, "run twice (HW SHA on/off) and emit a comparative summary")
+	fs.DurationVar(&o.BlockTime, "block-time", 0, "chain slot interval (e.g. 3s); enables budget mode together with --block-budget")
+	fs.DurationVar(&o.BlockBudget, "block-budget", 0, "max processing time per block (e.g. 500ms); the headline EFFECTIVE MAX TPS comes from this")
+	fs.IntVar(&o.Prefill, "prefill", 0, "transactions to pre-generate into the mempool before timing starts (recommended in budget mode)")
 	fs.BoolVar(&version, "version", false, "print version and exit")
 
 	fs.Usage = func() {
@@ -167,5 +174,16 @@ func mergeCLIIntoConfig(cfg *Config, o cliOverrides) {
 	}
 	if o.setMask["compare-sha"] {
 		cfg.CompareSHA = o.CompareSHA
+	}
+	if o.setMask["block-time"] {
+		cfg.BlockTime = o.BlockTime
+		cfg.BlockTimeStr = o.BlockTime.String()
+	}
+	if o.setMask["block-budget"] {
+		cfg.BlockBudget = o.BlockBudget
+		cfg.BlockBudgetStr = o.BlockBudget.String()
+	}
+	if o.setMask["prefill"] {
+		cfg.PrefillMempool = o.Prefill
 	}
 }

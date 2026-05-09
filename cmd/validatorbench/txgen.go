@@ -9,6 +9,18 @@ import (
 	"sync/atomic"
 )
 
+// TxKind discriminates between transaction types so the validator can
+// pick the right execution path. Real klever-go has the same split: a
+// pure transfer never touches the VM, while an SC-call always does.
+type TxKind uint8
+
+const (
+	// TxKindSCCall invokes a function on a deployed contract.
+	TxKindSCCall TxKind = iota
+	// TxKindTransfer moves balance between two regular accounts. No VM.
+	TxKindTransfer
+)
+
 // Tx is the in-memory representation of a transaction that has been
 // produced by the workload generator and is ready to enter the mempool.
 //
@@ -16,17 +28,19 @@ import (
 //   - re-marshal it (P2P style)
 //   - hash it
 //   - verify its ed25519 signature
-//   - execute it through the VM
+//   - execute it through the VM (or skip it for transfers)
 //
 // We keep the marshalled bytes around because that is the dominant
 // memory profile in the real validator (mempool stores serialized txs).
 type Tx struct {
+	Kind      TxKind
 	Sender    *Account
 	Recipient []byte
 	Function  string
 	Arguments [][]byte
 	GasLimit  uint64
 	GasPrice  uint64
+	Value     int64 // amount transferred for TxKindTransfer
 
 	SeqID uint64
 
@@ -68,9 +82,19 @@ func NewTxBuilder(cfg Config) *TxBuilder {
 // seqCounter provides unique per-tx ids without locking.
 var seqCounter atomic.Uint64
 
-// Build creates a fully-signed Tx for the given (sender, recipient, args).
-// The sender's nonce is consumed and incremented atomically so concurrent
-// generators don't collide.
+// BuildTransfer creates a value transfer between two regular accounts.
+// No VM dispatch — the executor will just verify, update nonces, and
+// move balance.
+func (b *TxBuilder) BuildTransfer(sender *Account, recipient []byte, value int64) *Tx {
+	tx := b.Build(sender, recipient, "", nil)
+	tx.Kind = TxKindTransfer
+	tx.Value = value
+	return tx
+}
+
+// Build creates a fully-signed SC-call Tx. The sender's nonce is
+// consumed and incremented atomically so concurrent generators don't
+// collide.
 //
 // Layout of Bytes (deterministic, big-endian):
 //

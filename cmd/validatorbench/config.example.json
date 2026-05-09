@@ -29,5 +29,9 @@
   "progress_interval_seconds": 2,
 
   "warmup_transactions": 200,
-  "compare_sha": false
+  "compare_sha": false,
+
+  "block_time": "3s",
+  "block_budget": "500ms",
+  "prefill_mempool": 5000
 }
