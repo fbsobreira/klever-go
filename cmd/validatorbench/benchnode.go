@@ -18,8 +18,10 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
+	"strings"
 	syncGo "sync"
 	"time"
 
@@ -67,6 +69,7 @@ import (
 	"github.com/klever-io/klever-go/tools"
 	"github.com/klever-io/klever-go/tools/marshal"
 	"github.com/klever-io/klever-go/tools/typeConverters/uint64ByteSlice"
+	"github.com/klever-io/klever-go/vmcommon"
 	"github.com/klever-io/klever-go/vmcommon/parsers"
 )
 
@@ -147,6 +150,7 @@ type BenchNode struct {
 type benchTxPreprocessor interface {
 	CreateAndProcessBlockTransactions(blk *block.Block, haveTime func() bool) (data.ProcessResults, error)
 	CreateBlockStarted()
+	RemoveTxsFromPools(blk *block.Block) error
 }
 
 // NewBenchNode boots the bench node up to the kapp controller.
@@ -540,7 +544,13 @@ func (bn *BenchNode) initVMAndSC() error {
 		VMOutputCacher:      txcache.NewDisabledCache(),
 		WasmVMChangeLocker:  bn.wasmVMLocker,
 		AccountsCacher:      bn.cacher,
-		IsGenesisProcessing: false,
+		// IsGenesisProcessing is the only path the production scProcessor
+		// allows direct SC deploys on. Outside genesis the chain only
+		// permits deploys via the proposal mechanism. The bench needs to
+		// deploy contracts on demand for SC workloads, so we run in
+		// genesis mode end-to-end. All other tx types (transfer, kapp
+		// invokes) behave identically regardless of this flag.
+		IsGenesisProcessing: true,
 	})
 	if err != nil {
 		return fmt.Errorf("sc processor: %w", err)
@@ -814,6 +824,144 @@ func (bn *BenchNode) BuildSignedTransfer(sender *BenchAccount, recipient []byte,
 	// Sign the hash with the sender's ed25519 private key. Production uses
 	// the SingleSigner abstraction; we go direct for cheaper allocation in
 	// the bench's hot path. The signature bytes are identical.
+	sig := ed25519.Sign(sender.Private, txHash)
+	tx.Signature = [][]byte{sig}
+
+	sender.Nonce++
+	return tx, txHash, nil
+}
+
+// BuildSignedSCDeploy constructs a fully-signed SC-deploy tx using the
+// production tx model. The tx targets the SC processor's deploy path:
+//
+//   - SmartContract.Type = SCDeploy, Address empty (computed by VM hook)
+//   - tx.RawData.Data carries one element per contract:
+//     "<codeHex>@<vmTypeHex>@<codeMetadataHex>@<arg1Hex>@<arg2Hex>..."
+//
+// Returns (tx, txHash, predictedAddress, error). The predicted address
+// is what the BlockChainHook.NewAddress derives — callers can use it as
+// the SC target before the deploy actually runs.
+func (bn *BenchNode) BuildSignedSCDeploy(owner *BenchAccount, code []byte, initArgs [][]byte, gasLimit uint64) (*dataTransaction.Transaction, []byte, []byte, error) {
+	// Encode the deploy data field per parsers/deployArgsParser.go format.
+	parts := []string{
+		hex.EncodeToString(code),
+		hex.EncodeToString(common.WasmVirtualMachine),
+		hex.EncodeToString((&vmcommon.CodeMetadata{Payable: true, Upgradeable: true, Readable: true}).ToBytes()),
+	}
+	for _, a := range initArgs {
+		parts = append(parts, hex.EncodeToString(a))
+	}
+	dataField := []byte(strings.Join(parts, "@"))
+
+	tx := dataTransaction.NewBaseTransaction(owner.Address[:], owner.Nonce, [][]byte{dataField}, 0, 0)
+	if err := tx.SetChainID(benchChainID); err != nil {
+		return nil, nil, nil, fmt.Errorf("chain id: %w", err)
+	}
+	tx.RawData.Version = 1
+
+	contract := &dataTransaction.SmartContract{
+		Type: dataTransaction.SmartContract_SCDeploy,
+		// Address empty for deploy.
+	}
+	if err := tx.PushContract(dataTransaction.TXContract_SmartContractType, contract); err != nil {
+		return nil, nil, nil, fmt.Errorf("push sc contract: %w", err)
+	}
+
+	// Set gas limits on the contract slot the SC processor uses.
+	if len(tx.RawData.Contract) == 0 {
+		return nil, nil, nil, fmt.Errorf("contract slot missing after push")
+	}
+	tx.GasLimit = gasLimit
+
+	// Production fee compute (sim=false; matches what CheckValidityTxValues
+	// does on the validator side). Then add gas budget on top of
+	// BandwidthFee so the production txProcessor's freeBandwidth ->
+	// gasLimit conversion lets the SC consume `gasLimit` gas units.
+	if err := bn.applyFeesWithGas(tx, gasLimit); err != nil {
+		return nil, nil, nil, err
+	}
+
+	txHash, err := tools.CalculateHash(bn.marshalizer, bn.hasher, tx.GetRaw())
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("calc hash: %w", err)
+	}
+	sig := ed25519.Sign(owner.Private, txHash)
+	tx.Signature = [][]byte{sig}
+
+	// Derive the SC address the same way the BlockChainHook will at
+	// runtime. The production VM reads the creator's nonce AFTER
+	// ProcessBandwidthFee bumps it, so we predict with owner.Nonce+1.
+	// CurrentRandomSeed is not yet wired (no block has been finalised),
+	// so it returns nil; passing the same nil here keeps the prediction
+	// consistent with what the VM will see.
+	scAddr, err := bn.blockHook.NewAddress(owner.Address[:], owner.Nonce+1, common.WasmVirtualMachine, nil)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("derive sc address: %w", err)
+	}
+
+	owner.Nonce++
+	return tx, txHash, scAddr, nil
+}
+
+// applyFeesWithGas computes the minimum production-validated fees for the
+// tx (using ComputeTransactionCost(false) — same path as CheckValidityTxValues),
+// then bumps BandwidthFee by gasLimit/gasMultiplier so the validator's
+// freeBandwidth -> gasLimit conversion grants the SC enough gas to run.
+//
+// This avoids needing a wired-up txSimulatorProcessor while still
+// producing a tx that passes production fee validation and has enough
+// gas headroom for SC execution.
+func (bn *BenchNode) applyFeesWithGas(tx *dataTransaction.Transaction, gasLimit uint64) error {
+	cost, err := bn.economics.ComputeTransactionCost(tx, false)
+	if err != nil {
+		return fmt.Errorf("compute cost: %w", err)
+	}
+	tx.RawData.KAppFee = cost.KAppFee
+	bw := cost.BandwidthFee
+	if gasLimit > 0 {
+		mult := uint64(cost.GasMultiplier)
+		if mult == 0 {
+			mult = 1
+		}
+		bw += int64(gasLimit / mult)
+	}
+	tx.RawData.BandwidthFee = bw
+	return nil
+}
+
+// BuildSignedSCCall constructs a fully-signed SC-invoke tx using the
+// production tx model. The data field is "<funcName>@<arg1Hex>@…".
+func (bn *BenchNode) BuildSignedSCCall(sender *BenchAccount, scAddr []byte, function string, args [][]byte, gasLimit uint64) (*dataTransaction.Transaction, []byte, error) {
+	parts := []string{function}
+	for _, a := range args {
+		parts = append(parts, hex.EncodeToString(a))
+	}
+	dataField := []byte(strings.Join(parts, "@"))
+
+	tx := dataTransaction.NewBaseTransaction(sender.Address[:], sender.Nonce, [][]byte{dataField}, 0, 0)
+	if err := tx.SetChainID(benchChainID); err != nil {
+		return nil, nil, fmt.Errorf("chain id: %w", err)
+	}
+	tx.RawData.Version = 1
+
+	contract := &dataTransaction.SmartContract{
+		Type:    dataTransaction.SmartContract_SCInvoke,
+		Address: scAddr,
+	}
+	if err := tx.PushContract(dataTransaction.TXContract_SmartContractType, contract); err != nil {
+		return nil, nil, fmt.Errorf("push sc contract: %w", err)
+	}
+
+	tx.GasLimit = gasLimit
+
+	if err := bn.applyFeesWithGas(tx, gasLimit); err != nil {
+		return nil, nil, err
+	}
+
+	txHash, err := tools.CalculateHash(bn.marshalizer, bn.hasher, tx.GetRaw())
+	if err != nil {
+		return nil, nil, fmt.Errorf("calc hash: %w", err)
+	}
 	sig := ed25519.Sign(sender.Private, txHash)
 	tx.Signature = [][]byte{sig}
 
