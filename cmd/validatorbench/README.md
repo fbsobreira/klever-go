@@ -171,3 +171,39 @@ with in-memory state.
   proposal mechanism). The bench runs the SC processor in genesis
   mode end-to-end so it can deploy contracts on demand. This does
   not affect transfer or invoke behavior.
+
+## Open question for a separate PR: the on-budget signature verify
+
+The `BenchmarkProdTransferBatch` profiling work found a cost the
+benchmark can't fix from this side without diverging from production:
+
+  Production code path verifies every tx's ed25519 signature TWICE:
+
+    1. At mempool intake (off-budget, in the 3.5s window between slots):
+       `core/process/dataValidators/txValidator.go:218`
+         txv.singleSigner.Verify(pub, hash, sig)
+
+    2. Again at execution time (on-budget, inside the 500ms slot budget):
+       `core/process/transaction/baseProcess.go:129`
+         txProc.singleSigner.Verify(pub, txHash, signature)
+       called via PreProcessTransaction -> checkTxValues -> validatePermission
+       -> verifySignatures, on EVERY tx the preprocessor admits to the block.
+
+  CPU profile of a 12000-tx block on the test VM attributes ~38% of
+  the on-budget cost to that second verify. Skipping it (e.g. with a
+  "verified at intake" flag set by the interceptor and trusted by the
+  txProcessor) would drop per-tx cost from ~125 µs to ~77 µs on this
+  hardware — fitting ~6500 transfers per 500 ms slot instead of ~4000.
+
+  **The bench deliberately does not work around this.** The whole point
+  of moving the bench onto the production pipeline (BenchNode +
+  preprocess.transactions + txProcessor) was so the bench numbers
+  track whatever the production code actually does. If we add a
+  skip-verify flag here, we'd be measuring something the live
+  validator doesn't do.
+
+  Tracked as a follow-up: a separate PR against the validator's
+  txProcessor + interceptor to thread the "already verified" signal
+  through. Once that lands, this benchmark will automatically reflect
+  the speed-up — no changes needed in cmd/validatorbench/.
+
